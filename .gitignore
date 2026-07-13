@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+.mypy_cache/
+# P3-prep capture data + decision db (runtime artifacts, not source)
+logs/
+*.db
+*.sqlite
+# IDE
+.idea/
