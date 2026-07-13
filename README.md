@@ -1,215 +1,348 @@
 # router-relay
 
-An OpenAI-compatible API relay with smart routing (inspired by OpenSquilla's
-`SquillaRouter` + Ensemble). **P0** is a transparent passthrough: opencode (or any
-OpenAI-compatible client) points at this server, and every request is forwarded
-verbatim to an upstream OpenAI-compatible provider (OpenAI, OpenRouter, …),
-streaming included.
+一个带智能路由的 OpenAI 兼容 API 中转，灵感来自 OpenSquilla 的
+`SquillaRouter` + Ensemble。opencode（或任意 OpenAI 兼容客户端）指向本服务，
+relay 把请求转发给上游 OpenAI 兼容 provider（OpenAI / OpenRouter /
+marketingforce / …），并可选地**按 turn 难度路由到最省的模型**、和/或**对复杂
+turn 融合多个模型**。
 
-Later phases add: **P1** per-turn routing (LightGBM classifier → tier → model),
-**P2** B5 ensemble fusion, **P3** a self-learning loop. The routing/fusion seams
-are already marked in `src/relay/upstream.py` (`_chat_stream` is the hook point).
+当前状态：
+- **P0** 透明透传 —— 完成 ✅
+- **P1** 规则路由（特征 → `c0..c3` 档位 → 模型覆盖）—— 完成 ✅
+- **P2** B5 ensemble 融合（并行 proposer → aggregator LLM）—— 完成 ✅
+- **P3 前置** 按日期分文件 JSONL 捕获 + 抱怨信号（离线标签回填用）—— 完成 ✅
+- **P3** LightGBM 训练闭环 —— 待做（需要先攒真实流量数据）
 
-## Layout
+## 目录结构
 
 ```
 router-relay/
 ├── pyproject.toml
-├── .env.example
+├── .env.example              # 配置模板（复制成 .env）
 └── src/relay/
     ├── __init__.py
-    ├── __main__.py     # python -m relay  /  router-relay
-    ├── app.py          # FastAPI app + routes (/v1/chat/completions, /v1/models, /healthz)
-    ├── auth.py         # Bearer token dependency
-    ├── config.py       # env-driven settings (pydantic-settings)
-    ├── errors.py       # RelayError → OpenAI-shaped error envelope
-    └── upstream.py     # httpx client + SSE passthrough
+    ├── __main__.py           # python -m relay  /  router-relay
+    ├── app.py                 # FastAPI 应用 + 路由
+    ├── auth.py                # Bearer 鉴权依赖
+    ├── capture.py             # P3 前置：按日期分文件 JSONL 捕获
+    ├── config.py              # env 驱动配置（pydantic-settings）
+    ├── ensemble.py            # P2：B5 融合（proposer → aggregator）
+    ├── errors.py              # RelayError → OpenAI 形状错误信封
+    ├── upstream.py            # httpx 客户端 + SSE 透传
+    └── router/
+        ├── __init__.py
+        ├── features.py        # handcrafted 特征提取 + 抱怨检测
+        ├── scorer.py          # 规则打分 → 档位 + 置信度
+        ├── policy.py          # confidence_gate → complaint_upgrade → large_context_floor → sticky
+        ├── tiers.py           # 档位 → 模型映射（marketingforce preset）
+        └── runtime.py         # RoutingDecision、历史、有界 apply_router
 ```
 
-## Setup
+## 1. 前置
 
-Requires Python ≥ 3.10 and `uv` (recommended) or pip.
+Python ≥ 3.10，`uv`（推荐）或 pip。
+
+## 2. 安装
 
 ```sh
 cd E:\PY_CODE\router-relay
-
-# 1. install (creates .venv)
-uv sync
-#   — or —
+uv sync                       # 建 .venv 并装依赖
+#  — 或 —
 python -m venv .venv && .venv/Scripts/activate && pip install -e .
+```
 
-# 2. configure
-cp .env .env
-#   then edit .env: set RELAY_API_KEYS, UPSTREAM_BASE_URL, UPSTREAM_API_KEY
+## 3. 配置（`.env`）
 
-# 3. run
+```sh
+cp .env.example .env          # 然后编辑 .env
+```
+
+至少配这些（上游块是 OpenAI 兼容，OpenAI / OpenRouter / marketingforce 都行）：
+
+```ini
+# 入站鉴权（客户端用 Authorization: Bearer <token> 发送）
+RELAY_API_KEYS=<你的 relay token>
+
+# 上游 OpenAI 兼容 provider
+UPSTREAM_BASE_URL=https://api.openai.com/v1
+UPSTREAM_API_KEY=<你的上游 key>
+
+# 服务
+LISTEN_HOST=127.0.0.1
+LISTEN_PORT=8787
+```
+
+全部字段见下方**配置参考**，含路由 / ensemble / 捕获的功能开关（默认全关 =
+纯透传）。
+
+## 4. 启动
+
+```sh
+cd E:\PY_CODE\router-relay
 uv run router-relay
-#   — or —
+#  — 或 —
 uv run python -m relay
-#   — or —
+#  — 或 —
 uv run uvicorn relay.app:app --port 8787
 ```
 
-Server listens on `http://127.0.0.1:8787` by default.
+服务监听 `http://127.0.0.1:8787`，`Ctrl+C` 停止。
 
-## Configure opencode
+## 5. 连接 opencode
 
-Put this in `opencode.json` (project root or `~/.config/opencode/opencode.json`).
-The `model` keys **must match the ids your upstream accepts** (e.g. OpenAI model
-ids, or `openai/...` for OpenRouter).
+把下面放进 `opencode.json`（项目根或 `~/.config/opencode/opencode.json`）。
+`apiKey` 填你的 `RELAY_API_KEYS` 值；`models` 的 key **必须和上游接受的 id 一致**
+（下面是 MAAS 示例）。
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "relay/gpt-4o-mini",
+  "model": "relay/qwen3-max",
   "provider": {
     "relay": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "Router Relay (local)",
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
-        "apiKey": "sk-relay-dev-change-me"
+        "apiKey": "<你的 relay token>"
       },
       "models": {
-        "gpt-4o-mini": { "name": "GPT-4o mini (via relay)" },
-        "gpt-4o": { "name": "GPT-4o (via relay)" }
+        "qwen3-max": { "name": "Qwen3 Max" },
+        "gpt-5.4": { "name": "GPT-5.4" },
+        "claude-opus-4-8": { "name": "Claude Opus 4.8" },
+        "deepseek-r1": { "name": "DeepSeek R1" }
       }
     }
   }
 }
 ```
 
-Then run `opencode` and select the `relay/...` model.
+然后 `opencode` 里选 `relay/...` 模型即可。
 
-## Verify it works (curl)
+> 开了 `ROUTER_ENABLED=true` 后，opencode 里选哪个 model 只是个入口——
+> **真正模型由路由按 turn 难度决定**（简单 → `claude-3-5-haiku`，复杂 →
+> `claude-sonnet-4.5` / `claude-opus-4-8`）。
+
+## 5b. 连接 ZCode（Anthropic 端点）
+
+ZCode 用 **Anthropic** API 格式（`/v1/messages`），不是 OpenAI。relay 已加
+`/v1/messages` 端点（透传 + 路由；ensemble 在该路径跳过，因为它调
+`/chat/completions`）。DEFAULT_TIERS 也改成**双端点**模型（claude-3-5-haiku /
+qwen3.7-plus / claude-sonnet-4.5 / claude-opus-4-8——marketingforce 上同时支持
+openai+anthropic），所以同一套 preset 同时适配 opencode(OpenAI) 和 ZCode(Anthropic)。
+
+ZCode 的 provider 配置在 `~/.zcode/v2/config.json` 的 `provider` 对象里。加一条：
+
+```json
+"router-relay": {
+  "name": "Router Relay (local)",
+  "kind": "anthropic",
+  "options": {
+    "apiKey": "<你 .env 里的 RELAY_API_KEYS 值>",
+    "baseURL": "http://127.0.0.1:8787/v1",
+    "apiKeyRequired": true
+  },
+  "enabled": true,
+  "source": "custom",
+  "models": {
+    "GLM-5.2": {
+      "limit": {"context": 200000},
+      "modalities": {"input": ["text"], "output": ["text"]}
+    }
+  }
+}
+```
+
+> 我已帮你加好这条（备份在 `~/.zcode/v2/config.json.bak`）。ZCode 选的 `GLM-5.2`
+> 只是入口，relay 会按难度路由覆盖。
+
+步骤：
+1. **重启 relay**（你 8787 上跑的是加 `/v1/messages` 之前的旧代码，必须重启）：
+   `cd E:\PY_CODE\router-relay && uv run router-relay`
+2. **重启 ZCode**（读 config.json）→ Settings → 模型 provider → 选 **Router Relay (local)**。
+3. 先用 `ROUTER_OBSERVE_ONLY=true` 跑一阵（ZCode 仍走 GLM-5.2，relay 记录决策），
+   验证 `/v1/router/decisions` 合理后再切 `ROUTER_OBSERVE_ONLY=false` 让路由覆盖。
+4. 回退：在 Settings 切回原 provider 即可；或还原 `cp ~/.zcode/v2/config.json.bak ~/.zcode/v2/config.json`。
+
+## 6. 自检（curl，不依赖 opencode）
 
 ```sh
-# health (no auth)
+# 活性（无需鉴权）
 curl http://127.0.0.1:8787/healthz
 # {"status":"ok"}
 
-# auth gate (expect 401 without token)
+# 鉴权门（不带 token 应返回 401）
 curl http://127.0.0.1:8787/v1/models
 
-# list models (proxies upstream GET /v1/models)
-curl -H "Authorization: Bearer sk-relay-dev-change-me" \
-     http://127.0.0.1:8787/v1/models
+# 透传上游模型列表
+curl -H "Authorization: Bearer <你的 relay token>" http://127.0.0.1:8787/v1/models
 
-# non-stream chat
-curl -H "Authorization: Bearer sk-relay-dev-change-me" \
-     -H "Content-Type: application/json" \
-     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"ping"}]}' \
-     http://127.0.0.1:8787/v1/chat/completions
+# 非流式对话
+curl -H "Authorization: Bearer <你的 relay token>" -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-max","messages":[{"role":"user","content":"hi"}]}' \
+  http://127.0.0.1:8787/v1/chat/completions
 
-# streaming chat (SSE)
-curl -N -H "Authorization: Bearer sk-relay-dev-change-me" \
-     -H "Content-Type: application/json" \
-     -d '{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"count to 3"}]}' \
-     http://127.0.0.1:8787/v1/chat/completions
+# 流式对话（SSE）
+curl -N -H "Authorization: Bearer <你的 relay token>" -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-max","stream":true,"messages":[{"role":"user","content":"count to 3"}]}' \
+  http://127.0.0.1:8787/v1/chat/completions
+
+# 查路由决策（需开 ROUTER_ENABLED=true 才有数据）
+curl -H "Authorization: Bearer <你的 relay token>" \
+  "http://127.0.0.1:8787/v1/router/decisions?limit=10"
 ```
 
-## Configuration reference (`.env`)
+## 7. 推荐上线路径
 
-| Var | Default | Purpose |
+1. **先 observe + 捕获**——不改模型行为，验证规则打分，同时开始攒 P3 训练数据：
+   ```ini
+   ROUTER_ENABLED=true
+   ROUTER_OBSERVE_ONLY=true      # 只记录决策、不覆盖模型
+   ROUTER_CAPTURE_DIR=./logs    # 每 turn 落一条样本
+   ENSEMBLE_ENABLED=false
+   ```
+   正常用 opencode。决策进 `/v1/router/decisions` 和
+   `logs/router-samples-YYYY-MM-DD.jsonl`；客户端发的模型原样转发。
+2. **看几天决策对不对**——简单 turn 是不是 → `c0`，复杂 turn 是不是 → `c2/c3`？
+   不对就调 `ROUTER_CONFIDENCE_THRESHOLD` 或 `ROUTER_TIERS`。
+3. **切 route 模式**——`ROUTER_OBSERVE_ONLY=false`，路由开始真正覆盖模型。
+4. **（可选）开 ensemble**——`ENSEMBLE_ENABLED=true`（注意成本；别用
+   `deepseek-r1` 这类推理模型当 proposer）。
+5. **P3**——`logs/` 样本够了后，训 LightGBM 在同一 `score_features` 调用点替换规则打分。
+
+## P1 路由
+
+每个请求由确定性规则打分（长度 / 语言 / 代码比例 / 关键词桶 / 上下文规模）
+分到 `c0..c3` 档，策略链定档，该档模型覆盖客户端发的模型。打分在 worker
+线程里有界执行；超时/异常时透明透传客户端原模型，绝不阻塞请求。
+
+策略链：`confidence_gate`（置信度低 → 升档）→ `complaint_upgrade`（用户抱怨
+上一轮答案 → 升档）→ `large_context_floor`（上下文很长 → 抬到 `c2`）→
+`sticky`/防降档（避免会话中途在档位间反复横跳）。
+
+| 档位 | 默认模型（双端点 preset） | 用途 |
 | --- | --- | --- |
-| `RELAY_API_KEYS` | — | Comma-separated bearer tokens clients must send. Empty = open relay (dev only). |
-| `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | Upstream OpenAI-compatible base URL. |
-| `UPSTREAM_API_KEY` | — | Upstream API key (sent as `Authorization: Bearer`). |
-| `UPSTREAM_ORGANIZATION` | — | Optional `OpenAI-Organization` header. |
-| `DEFAULT_MODEL` | — | Fallback `model` when a request omits it. |
-| `LISTEN_HOST` | `127.0.0.1` | Bind host. |
-| `LISTEN_PORT` | `8787` | Bind port. |
-| `UPSTREAM_TIMEOUT` | `600` | Upstream request timeout (seconds). |
-| `LOG_LEVEL` | `info` | uvicorn log level. |
+| c0 | claude-3-5-haiku | 便宜/快——简单问答、闲聊 |
+| c1 | qwen3.7-plus | 中等 |
+| c2 | claude-sonnet-4.5 | 强——工程、设计 |
+| c3 | claude-opus-4-8 | 最强 |
 
-## P1 Routing
+四个都同时支持 marketingforce 的 openai + anthropic 端点，所以同一套 preset
+同时适配 opencode(`/v1/chat/completions`) 和 ZCode(`/v1/messages`)。只用单路径时可
+换更便宜的单端点模型（如 `qwen3-max` 仅 OpenAI）。
 
-Enable per-turn routing: each request is classified by a deterministic rule
-scorer (length / language / code ratio / keyword buckets / context size) into a
-difficulty tier `c0..c3`, a policy chain (`confidence_gate` → `large_context_floor`
-→ `sticky`/anti-downgrade) finalizes the tier, and the tier's model overrides the
-one the client sent. Scoring runs in a worker thread under a timeout; on timeout
-or error the relay transparently passes the client's model through (never blocks).
+覆盖某档（JSON）：`ROUTER_TIERS={"c3":{"model":"claude-opus-4-8"}}`。
 
-This mirrors OpenSquilla's SquillaRouter (`engine/steps/squilla_router.py`) at a
-fraction of the size: handcrafted features + policy seam, no trained model yet.
-A P3 LightGBM head can drop in at the same `score_features` call site.
-
-| Tier | Default model (marketingforce preset) | Use |
-| --- | --- | --- |
-| c0 | qwen3-max | cheap / fast — simple Q&A, chitchat |
-| c1 | deepseek-r1 | medium |
-| c2 | gpt-5.4 | strong — engineering, design |
-| c3 | claude-opus-4-8 | strongest |
-
-Enable in `.env`:
-
-```
-ROUTER_ENABLED=true
-# ROUTER_OBSERVE_ONLY=true   # record decisions but DON'T override — validate first
-# ROUTER_TIERS={"c3":{"model":"claude-opus-4-8"}}  # override a tier (JSON)
-```
-
-Inspect live routing:
-
-```sh
-curl -H "Authorization: Bearer $RELAY_KEY" \
-     "http://127.0.0.1:8787/v1/router/decisions?limit=20"
-```
-
-Decisions are kept in an in-memory ring buffer (last 100). Set `ROUTER_DECISION_DB`
-to a SQLite path to also persist them (aggregate features only — never prompt text).
-
-Run the scoring unit test:
-
-```sh
-uv run python tests/test_router_scoring.py
-```
+sticky 路由的 session key 由**第一条 user 消息**派生，故 per-会话粘性无需
+客户端配合（opencode 每轮重发完整历史——无状态 OpenAI 协议）。
 
 ## P2 Ensemble
 
-B5 fusion (inspired by OpenSquilla's `provider/ensemble.py`): for complex turns
-the routed model plus configured proposers run **in parallel** (non-stream) to
-produce draft answers; an aggregator LLM then fuses the drafts via a
-`<CANDIDATE N>` prompt into one final answer. Only `b5_fusion` mode (no voting /
-best-of-N). Only fires when the routed tier rank ≥ `ENSEMBLE_MIN_TIER` (default
-`c2`), so easy turns stay single-model.
+B5 融合：复杂 turn（路由档位 ≥ `ENSEMBLE_MIN_TIER`）时，路由 anchor 模型 +
+配置的 proposer **并行**（非流式）出草稿，aggregator LLM 用 `<CANDIDATE N>`
+prompt 把草稿融合成最终答案。只用 `b5_fusion` 模式。简单 turn 仍走单模型。
 
-Enable in `.env` (requires `ROUTER_ENABLED=true`):
-
-```
-ENSEMBLE_ENABLED=true
-ENSEMBLE_PROPOSERS=qwen3-max,deepseek-r1   # comma-separated; routed anchor is auto-prepended
-ENSEMBLE_AGGREGATOR=qwen3-max              # empty = use routed anchor as aggregator
-ENSEMBLE_MIN_TIER=c2                       # only fuse complex turns
-ENSEMBLE_MIN_SUCCESSFUL=2                   # quorum before aggregation
+```ini
+ENSEMBLE_ENABLED=true              # 需先 ROUTER_ENABLED=true
+ENSEMBLE_PROPOSERS=qwen3-max,deepseek-r1   # 路由 anchor 自动加入
+ENSEMBLE_AGGREGATOR=qwen3-max             # 空则用路由 anchor
+ENSEMBLE_MIN_TIER=c2                      # 只在复杂档触发
+ENSEMBLE_MIN_SUCCESSFUL=2                  # 聚合前的 quorum
 ```
 
-Behavior:
-- **Quorum**: if fewer than `ENSEMBLE_MIN_SUCCESSFUL` proposers succeed, fall back
-  to single-model passthrough on the routed anchor (`fallback_single`).
-- **Non-stream**: returns a JSON response with usage summed across all proposers
-  + the aggregator.
-- **Stream**: the aggregator's SSE is forwarded verbatim. The proposer phase is
-  awaited first (no heartbeat during that window) so proposer errors surface as
-  clean HTTP errors rather than broken mid-stream SSE.
-- **Tools**: requests carrying `tools` skip ensemble (P2 does not fuse
-  tool-calling) and fall through to single-model.
-- **Cost caveat**: reasoning models (e.g. `deepseek-r1`) as proposers can burn
-  many reasoning tokens that ignore `max_tokens`. Prefer non-reasoning models in
-  the proposer pool for cost control.
+行为：
+- **Quorum**：成功 proposer 少于 `ENSEMBLE_MIN_SUCCESSFUL` → 在路由 anchor 上
+  `fallback_single`。
+- **非流式**：JSON 响应，usage 是所有 proposer + aggregator 求和。
+- **流式**：aggregator 的 SSE 原样转发；proposer 阶段先 await 完（无心跳——
+  proposer 错误返回干净 HTTP 错误，而非中断的 SSE 流）。
+- **tools**：带 `tools` 的请求跳过 ensemble（P2 不融合 tool-calling）。
+- **成本提醒**：推理模型当 proposer 会烧不受 `max_tokens` 限制的推理 token，
+  proposer 池建议用非推理模型。
 
-## What P0/P1/P2 do NOT do yet
+## P3 前置捕获
 
-- No trained model / self-learning loop — P3 (LightGBM on captured decisions).
-- No SSE heartbeat during the ensemble proposer phase (could time out slow
-  clients) — a future P2.5.
-- Ensemble does not fuse tool-calling turns (skips when `tools` present).
+每 turn 一个训练样本，append 到**按日期分文件**的 JSONL
+（`logs/router-samples-YYYY-MM-DD.jsonl`，跨天自动切新文件）。只存聚合特征标量
+——**绝不存 prompt 明文**。
 
-## Roadmap
+```ini
+ROUTER_CAPTURE_DIR=./logs      # 空 = 不捕获
+```
 
-- **P2.5**: SSE heartbeat comment-frames during the proposer phase so streaming
-  clients don't time out; optional `router_dynamic` proposer selection.
-- **P3** self-learning: capture features → feedback join → label realignment →
-  incremental retrain → session-holdout CV + cost-ceiling gate → atomic swap +
-  live rollback.
+每行格式：
+```json
+{"decision_id":"...","ts_ms":...,"session_key":"...","tier":"c2","model":"gpt-5.4",
+ "client_model":"qwen3-max","confidence":0.62,"difficulty":0.51,"source":"rule_scorer",
+ "executed_kind":"single","trail":[{"stage":"complaint_upgrade",...}],
+ "feature_snapshot":{"char_len":85,"hard_kw_hits":4,"complaint_detected":false,...},
+ "schema_version":1,"label":null}
+```
+
+`label` 由离线 realignment 脚本回填。标签信号是**隐式**的（relay 无 UI 做显式
+赞踩）：turn *i* 的 `complaint_detected` 表示 turn *i−1* 可能欠路由（用户在抱怨
+上一轮答案）→ 给 turn *i−1* 升档标签。`session_key` + `ts_ms` 让离线脚本关联
+同一会话的相邻 turn。
+
+这就是未来 P3 LightGBM 的训练数据底座。
+
+## 配置参考（`.env`）
+
+### 基础
+
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `RELAY_API_KEYS` | — | 客户端须发的 bearer token，逗号分隔。空 = 开放 relay（仅 dev）。 |
+| `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | 上游 OpenAI 兼容 base URL。 |
+| `UPSTREAM_API_KEY` | — | 上游 key（`Authorization: Bearer`）。 |
+| `UPSTREAM_ORGANIZATION` | — | 可选 `OpenAI-Organization` 头。 |
+| `DEFAULT_MODEL` | — | 请求缺 `model` 时的兜底。 |
+| `LISTEN_HOST` / `LISTEN_PORT` | `127.0.0.1` / `8787` | 绑定。 |
+| `UPSTREAM_TIMEOUT` | `600` | 上游请求超时（秒）。 |
+| `LOG_LEVEL` | `info` | uvicorn 日志级别。 |
+
+### P1 路由
+
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `ROUTER_ENABLED` | `false` | 总开关（关 = 纯透传）。 |
+| `ROUTER_OBSERVE_ONLY` | `false` | 只记不覆盖模型（安全 rollout）。 |
+| `ROUTER_TIMEOUT_SECONDS` | `2.0` | 打分硬预算；超时 → 透传。 |
+| `ROUTER_STICKY_TURNS` | `3` | 每会话保留的近期档位数（防横跳）。 |
+| `ROUTER_CONFIDENCE_THRESHOLD` | `0.55` | 置信度低于此 → confidence_gate 升一档。 |
+| `ROUTER_LARGE_CONTEXT_CHARS` | `64000` | 上下文超此 → large_context_floor 抬到 c2。 |
+| `ROUTER_TIERS` | — | JSON 档→模型覆盖；空 = 内置 preset。 |
+| `ROUTER_DECISION_DB` | — | 可选 SQLite 路径，持久化决策。 |
+| `ROUTER_CAPTURE_DIR` | — | P3 前置：按日期分文件 JSONL 目录。 |
+| `ROUTER_LOG_DECISIONS` | `true` | INFO 打路由决策日志。 |
+
+### P2 Ensemble
+
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `ENSEMBLE_ENABLED` | `false` | 需 `ROUTER_ENABLED=true`。 |
+| `ENSEMBLE_PROPOSERS` | — | proposer 模型 id，逗号分隔（anchor 自动加入）。 |
+| `ENSEMBLE_AGGREGATOR` | — | aggregator 模型；空 = 路由 anchor。 |
+| `ENSEMBLE_MIN_TIER` | `c2` | 路由档位 ≥ 此才融合。 |
+| `ENSEMBLE_MIN_SUCCESSFUL` | `2` | 聚合前 quorum。 |
+| `ENSEMBLE_PROPOSER_TIMEOUT` / `ENSEMBLE_AGGREGATOR_TIMEOUT` | `60` / `120` | 各阶段超时（秒）。 |
+| `ENSEMBLE_CANDIDATE_MAX_CHARS` | `24000` | aggregator prompt 里截断每条草稿。 |
+
+## 关键文件
+
+| 路径 | 用途 |
+| --- | --- |
+| `.env` | 全部运行配置（已 gitignore，不进版本库）。 |
+| `logs/router-samples-YYYY-MM-DD.jsonl` | P3 训练数据（自动生成）。 |
+| `src/relay/router/scorer.py` | 规则打分——P3 LightGBM 替换点。 |
+| `src/relay/ensemble.py` | B5 融合逻辑。 |
+| `src/relay/capture.py` | 按日期分文件 JSONL 捕获。 |
+| `tests/test_router_scoring.py` | 打分自测：`uv run python tests/test_router_scoring.py`。 |
+
+## 路线图
+
+- **P2.5**：ensemble proposer 阶段加 SSE 心跳注释帧，防流式客户端超时；可选
+  `router_dynamic` proposer 选择。
+- **P3** 自学习：读捕获的 JSONL → 关联会话 → 标签 realignment（抱怨/重试信号）
+  → 增量 LightGBM 重训 → session-holdout CV + 成本上限 gate → 原子指针切换 +
+  live rollback，替换 `score_features`。

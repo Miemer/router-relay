@@ -87,8 +87,15 @@ async def list_models(upstream: UpstreamClient = Depends(get_upstream)):
     return JSONResponse(content=data)
 
 
-@app.post("/v1/chat/completions", dependencies=[Depends(verify_token)])
-async def chat_completions(request: Request, upstream: UpstreamClient = Depends(get_upstream)):
+async def _handle_completion(
+    request: Request, upstream: UpstreamClient, forward_path: str, allow_ensemble: bool
+):
+    """Shared handler for OpenAI (/chat/completions) and Anthropic (/messages) paths.
+
+    ``forward_path`` is the upstream endpoint path; ``allow_ensemble`` is False on
+    the Anthropic path because ensemble calls /chat/completions (OpenAI-shaped).
+    Routing applies to both paths (it only reads `messages` + overrides `model`).
+    """
     try:
         body = await request.json()
     except Exception:
@@ -127,9 +134,10 @@ async def chat_completions(request: Request, upstream: UpstreamClient = Depends(
             if capture is not None:
                 asyncio.create_task(capture.write(decision))  # P3-prep training data
 
-    # ── P2 ensemble: B5 fusion for complex tiers (wraps after routing) ──
+    # ── P2 ensemble: B5 fusion for complex tiers (OpenAI path only) ──
     if (
-        settings.ensemble_enabled
+        allow_ensemble
+        and settings.ensemble_enabled
         and decision is not None
         and not settings.router_observe_only
         and not body.get("tools")  # P2 doesn't fuse tool-calling; skip when tools present
@@ -148,7 +156,24 @@ async def chat_completions(request: Request, upstream: UpstreamClient = Depends(
             )
             return ensemble_resp
 
-    return await upstream.chat_completions(body, stream=stream)
+    return await upstream.chat_completions(body, stream=stream, path=forward_path)
+
+
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_token)])
+async def chat_completions(request: Request, upstream: UpstreamClient = Depends(get_upstream)):
+    """OpenAI-compatible endpoint (opencode, openai clients, /v1/chat/completions)."""
+    return await _handle_completion(request, upstream, "/chat/completions", allow_ensemble=True)
+
+
+@app.post("/v1/messages", dependencies=[Depends(verify_token)])
+async def anthropic_messages(request: Request, upstream: UpstreamClient = Depends(get_upstream)):
+    """Anthropic-compatible endpoint (ZCode, /v1/messages).
+
+    Forwards to upstream /messages. Routing still applies (override model per tier);
+    the tier models must be Anthropic-capable on the upstream (see DEFAULT_TIERS).
+    Ensemble is skipped here — it calls /chat/completions (OpenAI-shaped).
+    """
+    return await _handle_completion(request, upstream, "/messages", allow_ensemble=False)
 
 
 @app.get("/v1/router/decisions", dependencies=[Depends(verify_token)])

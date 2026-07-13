@@ -59,12 +59,17 @@ class UpstreamClient:
         self._raise_for_status(resp)
         return resp.json()
 
-    async def chat_completions(self, body: dict, stream: bool):
-        """Forward a chat-completion request. Returns a JSONResponse or StreamingResponse."""
+    async def chat_completions(self, body: dict, stream: bool, path: str = "/chat/completions"):
+        """Forward a completion request. Returns a JSONResponse or StreamingResponse.
+
+        ``path`` is the upstream endpoint path: ``/chat/completions`` (OpenAI) or
+        ``/messages`` (Anthropic). The body shape must match the path — the caller
+        is responsible for routing the right protocol to the right path.
+        """
         if stream:
-            return await self._chat_stream(body)
+            return await self._chat_stream(body, path)
         try:
-            resp = await self.client.post("/chat/completions", json=body)
+            resp = await self.client.post(path, json=body)
         except httpx.RequestError as exc:
             raise RelayError(
                 502,
@@ -73,10 +78,10 @@ class UpstreamClient:
         self._raise_for_status(resp)
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
 
-    async def _chat_stream(self, body: dict) -> StreamingResponse:
+    async def _chat_stream(self, body: dict, path: str = "/chat/completions") -> StreamingResponse:
         # Open the upstream stream first so we can surface a clean error before
         # beginning our own SSE response.
-        request = self._client.build_request("POST", "/chat/completions", json=body)
+        request = self._client.build_request("POST", path, json=body)
         try:
             resp = await self._client.send(request, stream=True)
         except httpx.RequestError as exc:
