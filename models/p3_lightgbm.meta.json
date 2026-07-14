@@ -1,0 +1,40 @@
+{
+  "feature_order": [
+    "char_len",
+    "word_count",
+    "zh_ratio",
+    "code_ratio",
+    "has_code_block",
+    "has_json",
+    "has_yaml",
+    "has_table",
+    "easy_kw_hits",
+    "hard_kw_hits",
+    "has_url",
+    "has_file_ref",
+    "n_messages",
+    "total_context_chars",
+    "turn_index",
+    "complaint_detected",
+    "complaint_hits"
+  ],
+  "tiers": [
+    "c0",
+    "c1",
+    "c2",
+    "c3"
+  ],
+  "num_samples": 76,
+  "tier_distribution": {
+    "c0": 21,
+    "c1": 47,
+    "c2": 6,
+    "c3": 2
+  },
+  "val_accuracy": 0.8,
+  "schema_version": 1,
+  "trained_on": [
+    "2026-07-13",
+    "2026-07-14"
+  ]
+}

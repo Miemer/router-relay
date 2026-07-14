@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("relay.router")
 
 
-def _derive_source(trail: list) -> str:
+def _derive_source(trail: list, base: str = "rule_scorer") -> str:
     """Derive the decision `source` from which policy stages fired.
 
     Diversifies the captured provenance so P3 training data can distinguish
@@ -38,17 +38,21 @@ def _derive_source(trail: list) -> str:
     follows the OpenSquilla retrospective label intent: complaint_upgrade and
     sticky are the most informative (they signal under-routing risk), then
     confidence_gate, then large_context_floor.
+
+    ``base`` is ``"rule_scorer"`` (default) or ``"ml_head"`` (when the P3
+    LightGBM model replaces ``score_features``). The policy stages that fire
+    after scoring are the same regardless of scorer.
     """
     stages = {t[0] for t in trail}
     if "complaint_upgrade" in stages:
-        return "rule_scorer:complaint_upgrade"
+        return f"{base}:complaint_upgrade"
     if "sticky" in stages:
-        return "rule_scorer:sticky"
+        return f"{base}:sticky"
     if "confidence_gate" in stages:
-        return "rule_scorer:confidence_gate"
+        return f"{base}:confidence_gate"
     if "large_context_floor" in stages:
-        return "rule_scorer:large_context_floor"
-    return "rule_scorer"
+        return f"{base}:large_context_floor"
+    return base
 
 
 @dataclass
@@ -220,13 +224,29 @@ async def apply_router(body: dict, settings: "Settings", history: RoutingHistory
 
     try:
         # Bounded execution: run the (sync) scorer in a worker thread with a
-        # timeout. For the rule scorer this is sub-millisecond and defensive;
-        # the seam is forward-compatible with a P3 LightGBM/ONNX head that
-        # could be slower. Timeout/exception → passthrough (client's model).
-        score = await asyncio.wait_for(
-            asyncio.to_thread(score_features, features),
-            timeout=settings.router_timeout_seconds,
-        )
+        # timeout. For the rule scorer this is sub-millisecond; for the P3 ML
+        # head it's ~0.1ms (LightGBM predict). Timeout/exception → passthrough.
+        #
+        # Scorer selection: if ROUTER_ML_MODEL_PATH is set and the model loads,
+        # the ML head replaces score_features. On any failure, falls back to
+        # the rule scorer transparently (never block a request for ML).
+        ml_head = None
+        if settings.router_ml_model_path:
+            from .ml_head import get_ml_head
+            ml_head = get_ml_head(settings.router_ml_model_path)
+
+        if ml_head is not None:
+            score = await asyncio.wait_for(
+                asyncio.to_thread(ml_head.score, features),
+                timeout=settings.router_timeout_seconds,
+            )
+            scorer_base = "ml_head"
+        else:
+            score = await asyncio.wait_for(
+                asyncio.to_thread(score_features, features),
+                timeout=settings.router_timeout_seconds,
+            )
+            scorer_base = "rule_scorer"
     except asyncio.TimeoutError:
         logger.warning(
             "router: scoring timed out after %ss; passthrough",
@@ -248,7 +268,7 @@ async def apply_router(body: dict, settings: "Settings", history: RoutingHistory
         model=model or client_model,
         confidence=score.confidence,
         difficulty=score.difficulty,
-        source=_derive_source(trail),
+        source=_derive_source(trail, base=scorer_base),
         trail=trail,
         feature_snapshot=features.to_snapshot(),
         client_model=client_model,

@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     # (router-raw-YYYY-MM-DD.jsonl) for LLM-as-judge offline labeling.
     # Default false — privacy-preserving (no prompt text stored unless opted in).
     capture_raw_content: bool = False
+    # P3: path to a trained LightGBM model (output of scripts/train_p3.py).
+    # When set, the ML head replaces the rule scorer at the apply_router seam.
+    # Empty = use the rule scorer (default). If the model fails to load, the
+    # caller transparently falls back to the rule scorer (never blocks).
+    router_ml_model_path: str = ""
 
     # ── P2 ensemble (B5 fusion: N proposers → 1 aggregator) ──
     # Ensemble wraps AFTER routing; only fires for routed tiers >= ensemble_min_tier

@@ -13,3 +13,4 @@ logs/
 *.sqlite
 # IDE
 .idea/
+.zcode/

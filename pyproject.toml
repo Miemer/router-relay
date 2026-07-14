@@ -12,6 +12,8 @@ dependencies = [
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "aiosqlite>=0.20",
+    "lightgbm>=4.3",
+    "numpy>=1.26",
 ]
 
 [project.scripts]

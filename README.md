@@ -21,7 +21,8 @@ router-relay/
 ├── .env.example              # 配置模板（复制成 .env）
 ├── scripts/
 │   ├── realign_labels.py     # 离线标签回填（decisions + outcomes + judge → labeled）
-│   └── judge_labels.py       # LLM-as-judge 绝对难度标注（user msg → optimal_tier）
+│   ├── judge_labels.py       # LLM-as-judge 绝对难度标注（user msg → optimal_tier）
+│   └── train_p3.py           # LightGBM 训练（labeled JSONL → p3_lightgbm.txt）
 └── src/relay/
     ├── __init__.py
     ├── __main__.py           # python -m relay  /  router-relay
@@ -355,6 +356,43 @@ uv run python scripts/realign_labels.py --date 2026-07-14
 
 `label_source` 字段标注每条记录的标签来源，便于分析。
 
+### P3 LightGBM 训练 + 推理
+
+标签就绪后，训练一个 LightGBM 4 分类器（c0..c3），作为 `score_features` 的
+drop-in 替换。推理 ~0.1ms（CPU），与规则打分器共享同一 `FeatureBundle` 接口。
+
+**训练**（读所有日期的 `router-labeled-*.jsonl`，过滤 `optimal_tier != null`）：
+```sh
+uv run python scripts/train_p3.py --auto
+# 输出分类报告 + 混淆矩阵 + 特征重要性
+# 保存 models/p3_lightgbm.txt + models/p3_lightgbm.meta.json
+```
+
+**激活**（`.env` 里设，重启 server）：
+```ini
+ROUTER_ML_MODEL_PATH=models/p3_lightgbm.txt
+```
+设置后 `apply_router` 自动用 ML head 替代规则打分器；路径无效或加载失败 →
+透明回退到规则打分器（不阻塞请求）。`source` 字段标为 `ml_head`。
+
+**迭代重训**（攒更多数据后）：
+```sh
+# 1. 对新流量跑 judge + realignment
+uv run python scripts/judge_labels.py --date 2026-07-20 --skip-judged
+uv run python scripts/realign_labels.py --date 2026-07-20
+
+# 2. 用全部日期数据重新训练（--auto 自动发现所有 router-labeled-*.jsonl）
+uv run python scripts/train_p3.py --auto
+# → 覆盖 models/p3_lightgbm.txt，重启 server 即生效
+
+# 保留多版本对比：
+uv run python scripts/train_p3.py --auto --output models/p3_v2.txt
+ROUTER_ML_MODEL_PATH=models/p3_v2.txt uv run router-relay
+```
+
+建议每攒 200-300 条新带标签数据重训一次，对比验证集准确率。
+数据到 1000+ 条后可关掉 `ROUTER_OBSERVE_ONLY=false` 让 ML head 真正接管路由。
+
 ## 配置参考（`.env`）
 
 ### 基础
@@ -384,6 +422,7 @@ uv run python scripts/realign_labels.py --date 2026-07-14
 | `ROUTER_DECISION_DB` | — | 可选 SQLite 路径，持久化决策。 |
 | `ROUTER_CAPTURE_DIR` | — | P3 前置：按日期分文件 JSONL 目录。 |
 | `CAPTURE_RAW_CONTENT` | `false` | 存用户消息文本到 `router-raw-*.jsonl`（judge 标注用）。默认关=不存 prompt 明文。 |
+| `ROUTER_ML_MODEL_PATH` | — | P3：LightGBM 模型路径（`train_p3.py` 输出）。设置后 ML head 替代规则打分器；空或无效=规则打分器。 |
 | `ROUTER_LOG_DECISIONS` | `true` | INFO 打路由决策日志。 |
 
 ### P2 Ensemble
@@ -409,10 +448,13 @@ uv run python scripts/realign_labels.py --date 2026-07-14
 | `logs/router-judge-YYYY-MM-DD.jsonl` | P3 judge 标签（LLM-as-judge 绝对难度，judge 脚本生成）。 |
 | `logs/router-labeled-YYYY-MM-DD.jsonl` | 离线回填后的带标签训练文件（realign 脚本生成）。 |
 | `src/relay/router/scorer.py` | 规则打分——P3 LightGBM 替换点。 |
+| `src/relay/router/ml_head.py` | P3 ML head：加载 LightGBM 模型 → `FeatureBundle → ScoreResult`。 |
 | `src/relay/ensemble.py` | B5 融合逻辑。 |
 | `src/relay/capture.py` | decisions + outcomes + raw 三文件 JSONL 捕获。 |
 | `scripts/realign_labels.py` | 离线标签回填：`uv run python scripts/realign_labels.py --date YYYY-MM-DD`。 |
 | `scripts/judge_labels.py` | LLM-as-judge 标注：`uv run python scripts/judge_labels.py --date YYYY-MM-DD`。 |
+| `scripts/train_p3.py` | LightGBM 训练：`uv run python scripts/train_p3.py --auto`。 |
+| `models/p3_lightgbm.txt` | 训练好的模型（`train_p3.py` 输出，`ROUTER_ML_MODEL_PATH` 指向）。 |
 | `tests/test_router_scoring.py` | 打分 + 路由自测：`uv run python tests/test_router_scoring.py`。 |
 
 ## 路线图
