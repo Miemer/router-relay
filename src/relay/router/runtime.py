@@ -30,6 +30,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger("relay.router")
 
 
+def _derive_source(trail: list) -> str:
+    """Derive the decision `source` from which policy stages fired.
+
+    Diversifies the captured provenance so P3 training data can distinguish
+    rule_scorer base decisions from those adjusted by a policy stage. Priority
+    follows the OpenSquilla retrospective label intent: complaint_upgrade and
+    sticky are the most informative (they signal under-routing risk), then
+    confidence_gate, then large_context_floor.
+    """
+    stages = {t[0] for t in trail}
+    if "complaint_upgrade" in stages:
+        return "rule_scorer:complaint_upgrade"
+    if "sticky" in stages:
+        return "rule_scorer:sticky"
+    if "confidence_gate" in stages:
+        return "rule_scorer:confidence_gate"
+    if "large_context_floor" in stages:
+        return "rule_scorer:large_context_floor"
+    return "rule_scorer"
+
+
 @dataclass
 class RoutingDecision:
     decision_id: str
@@ -43,6 +64,11 @@ class RoutingDecision:
     trail: list  # list[tuple[str, dict]]
     feature_snapshot: dict
     client_model: str
+    signals: dict = None  # scorer sub-scores (len/code/kw/ctx + kw hits)
+
+    def __post_init__(self) -> None:
+        if self.signals is None:
+            self.signals = {}
 
     def summarize(self) -> str:
         trail_names = ",".join(t[0] for t in self.trail) or "-"
@@ -64,8 +90,9 @@ class RoutingDecision:
             "source": self.source,
             "trail": [{"stage": stage, **payload} for stage, payload in self.trail],
             "feature_snapshot": self.feature_snapshot,
+            "signals": self.signals,
             "client_model": self.client_model,
-            "executed_kind": "single",  # P2 will set "ensemble" when wrapped
+            "executed_kind": "single",  # overridden to "ensemble" when P2 wraps
         }
 
 
@@ -91,6 +118,22 @@ class RoutingHistory:
     def recent_decisions(self, limit: int = 20) -> list[RoutingDecision]:
         items = list(self._decisions)
         return list(reversed(items))[:limit] if limit < len(items) else list(reversed(items))
+
+    def previous_decision(
+        self, session_key: str, exclude_id: str | None = None
+    ) -> RoutingDecision | None:
+        """Return the most recent decision for a session (for complaint backfill).
+
+        Used by the retrospective_under_routing label path: when turn N detects
+        a complaint, the decision for turn N-1 in the same session is retrieved
+        so its label can be marked `under_routed`. ``exclude_id`` is the current
+        turn's decision id — it must be skipped because `apply_router` records
+        the current decision into the ring buffer *before* returning it.
+        """
+        for d in reversed(self._decisions):
+            if d.session_key == session_key and d.decision_id != exclude_id:
+                return d
+        return None
 
 
 class DecisionStore:
@@ -121,10 +164,17 @@ class DecisionStore:
                 difficulty REAL,
                 trail TEXT,
                 feature_snapshot TEXT,
+                signals TEXT,
                 client_model TEXT,
                 executed_kind TEXT
             )"""
         )
+        # Lightweight migration: add `signals` column to pre-existing tables.
+        try:
+            await self._db.execute("ALTER TABLE router_decisions ADD COLUMN signals TEXT")
+            logger.info("router: decision store migrated (added signals column)")
+        except Exception:
+            pass  # column already exists — expected on fresh tables
         await self._db.commit()
 
     async def close(self) -> None:
@@ -141,15 +191,15 @@ class DecisionStore:
                 await self._db.execute(
                     """INSERT OR REPLACE INTO router_decisions
                        (decision_id, ts_ms, session_key, tier, model, source,
-                        confidence, difficulty, trail, feature_snapshot,
+                        confidence, difficulty, trail, feature_snapshot, signals,
                         client_model, executed_kind)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         rec["decision_id"], rec["ts_ms"], rec["session_key"],
                         rec["tier"], rec["model"], rec["source"], rec["confidence"],
                         rec["difficulty"], json.dumps(rec["trail"]),
-                        json.dumps(rec["feature_snapshot"]), rec["client_model"],
-                        rec["executed_kind"],
+                        json.dumps(rec["feature_snapshot"]), json.dumps(rec["signals"]),
+                        rec["client_model"], rec["executed_kind"],
                     ),
                 )
                 await self._db.commit()
@@ -198,10 +248,11 @@ async def apply_router(body: dict, settings: "Settings", history: RoutingHistory
         model=model or client_model,
         confidence=score.confidence,
         difficulty=score.difficulty,
-        source="rule_scorer",
+        source=_derive_source(trail),
         trail=trail,
         feature_snapshot=features.to_snapshot(),
         client_model=client_model,
+        signals=score.signals,
     )
     history.record(session_key, final_tier, decision)
     return decision

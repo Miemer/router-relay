@@ -30,7 +30,7 @@ from .errors import RelayError
 if TYPE_CHECKING:
     from .config import Settings
     from .router.runtime import RoutingDecision
-    from .upstream import UpstreamClient
+    from .upstream import StreamDoneCallback, UpstreamClient
 
 logger = logging.getLogger("relay.ensemble")
 
@@ -117,9 +117,15 @@ async def run_ensemble(
     upstream: "UpstreamClient",
     decision: "RoutingDecision",
     stream: bool,
+    on_stream_done: "StreamDoneCallback | None" = None,
 ):
     """Run B5 fusion. Returns a JSONResponse / StreamingResponse, or None to let the
-    caller fall back to single-model passthrough."""
+    caller fall back to single-model passthrough.
+
+    ``on_stream_done`` is forwarded to the upstream streaming call so the caller
+    can capture the full streaming outcome (usage/finish_reason) when the
+    aggregator (or fallback) stream completes.
+    """
     messages = body.get("messages") or []
     if not messages:
         return None
@@ -154,7 +160,7 @@ async def run_ensemble(
         )
         fb_body = dict(body)
         fb_body["model"] = anchor
-        return await upstream.chat_completions(fb_body, stream=stream)
+        return await upstream.chat_completions(fb_body, stream=stream, on_stream_done=on_stream_done)
 
     # Phase 2: aggregator fuses the drafts.
     agg_messages = _build_aggregator_messages(
@@ -166,7 +172,7 @@ async def run_ensemble(
 
     if stream:
         # Reuse the upstream streaming path; it forwards the aggregator's SSE verbatim.
-        return await upstream.chat_completions(agg_body, stream=True)
+        return await upstream.chat_completions(agg_body, stream=True, on_stream_done=on_stream_done)
 
     # Non-stream: call the aggregator and fold proposer usage into the response.
     try:

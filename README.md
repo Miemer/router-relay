@@ -10,8 +10,8 @@ turn 融合多个模型**。
 - **P0** 透明透传 —— 完成 ✅
 - **P1** 规则路由（特征 → `c0..c3` 档位 → 模型覆盖）—— 完成 ✅
 - **P2** B5 ensemble 融合（并行 proposer → aggregator LLM）—— 完成 ✅
-- **P3 前置** 按日期分文件 JSONL 捕获 + 抱怨信号（离线标签回填用）—— 完成 ✅
-- **P3** LightGBM 训练闭环 —— 待做（需要先攒真实流量数据）
+- **P3 前置** 按日期分文件 JSONL 捕获 + outcome sidecar + 抱怨回溯 + 离线标签回填 —— 完成 ✅
+- **P3** LightGBM 训练闭环 —— 待做（需要先攒真实流量 + outcome 数据）
 
 ## 目录结构
 
@@ -19,12 +19,15 @@ turn 融合多个模型**。
 router-relay/
 ├── pyproject.toml
 ├── .env.example              # 配置模板（复制成 .env）
+├── scripts/
+│   ├── realign_labels.py     # 离线标签回填（decisions + outcomes + judge → labeled）
+│   └── judge_labels.py       # LLM-as-judge 绝对难度标注（user msg → optimal_tier）
 └── src/relay/
     ├── __init__.py
     ├── __main__.py           # python -m relay  /  router-relay
-    ├── app.py                 # FastAPI 应用 + 路由
+    ├── app.py                 # FastAPI 应用 + 路由 + outcome 捕获
     ├── auth.py                # Bearer 鉴权依赖
-    ├── capture.py             # P3 前置：按日期分文件 JSONL 捕获
+    ├── capture.py             # P3 前置：decisions + outcomes 双文件 JSONL
     ├── config.py              # env 驱动配置（pydantic-settings）
     ├── ensemble.py            # P2：B5 融合（proposer → aggregator）
     ├── errors.py              # RelayError → OpenAI 形状错误信封
@@ -35,7 +38,7 @@ router-relay/
         ├── scorer.py          # 规则打分 → 档位 + 置信度
         ├── policy.py          # confidence_gate → complaint_upgrade → large_context_floor → sticky
         ├── tiers.py           # 档位 → 模型映射（marketingforce preset）
-        └── runtime.py         # RoutingDecision、历史、有界 apply_router
+        └── runtime.py         # RoutingDecision、历史、有界 apply_router、_derive_source
 ```
 
 ## 1. 前置
@@ -266,25 +269,91 @@ ENSEMBLE_MIN_SUCCESSFUL=2                  # 聚合前的 quorum
 （`logs/router-samples-YYYY-MM-DD.jsonl`，跨天自动切新文件）。只存聚合特征标量
 ——**绝不存 prompt 明文**。
 
+上游返回后，再追加一条 outcome 记录到 sidecar 文件
+（`logs/router-outcomes-YYYY-MM-DD.jsonl`），按 `decision_id` 关联。
+
 ```ini
 ROUTER_CAPTURE_DIR=./logs      # 空 = 不捕获
 ```
 
-每行格式：
+decision 行格式：
 ```json
 {"decision_id":"...","ts_ms":...,"session_key":"...","tier":"c2","model":"gpt-5.4",
- "client_model":"qwen3-max","confidence":0.62,"difficulty":0.51,"source":"rule_scorer",
- "executed_kind":"single","trail":[{"stage":"complaint_upgrade",...}],
+ "client_model":"qwen3-max","confidence":0.62,"difficulty":0.51,
+ "source":"rule_scorer:complaint_upgrade","executed_kind":"single",
+ "trail":[{"stage":"complaint_upgrade",...}],
  "feature_snapshot":{"char_len":85,"hard_kw_hits":4,"complaint_detected":false,...},
+ "signals":{"len_score":0.01,"code_score":0.0,"kw_score":-0.12,"ctx_score":0.05,...},
  "schema_version":1,"label":null}
 ```
 
-`label` 由离线 realignment 脚本回填。标签信号是**隐式**的（relay 无 UI 做显式
-赞踩）：turn *i* 的 `complaint_detected` 表示 turn *i−1* 可能欠路由（用户在抱怨
-上一轮答案）→ 给 turn *i−1* 升档标签。`session_key` + `ts_ms` 让离线脚本关联
-同一会话的相邻 turn。
+outcome 行格式（sidecar，同一 `decision_id` 可有多条）：
+```json
+{"decision_id":"...","ts_ms":...,"schema_version":1,
+ "outcome":"success","executed_kind":"single","latency_ms":1234,
+ "usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150},
+ "finish_reason":"stop","upstream_status":200,"label_hint":"appropriate"}
+```
+
+`label` 由离线 realignment 脚本回填。标签信号来源（按优先级）：
+
+1. **抱怨回溯**（`outcome="complaint_followup"`）：turn *i* 检测到抱怨 → 给 turn *i−1*
+   写 `label_hint="under_routed"`。这是 OpenSquilla 的 `retrospective_under_routing`，
+   relay 在线自动写入 outcome 文件，零额外成本。
+2. **上游错误**（`outcome="upstream_error"`）：模型无法服务请求 → `under_routed`。
+3. **token 效率启发**（`label_hint`）：强档位但输出 < 50 tokens → `over_routed`；
+   弱档位但输出 > 2000 tokens → `under_routed`。
+
+离线合并命令（read-only，不改原始捕获文件）：
+```sh
+uv run python scripts/realign_labels.py --date 2026-07-13
+# → 写出 logs/router-labeled-2026-07-13.jsonl（label + optimal_tier 已填充）
+uv run python scripts/realign_labels.py --dry-run   # 只打印分布，不写文件
+```
+
+`source` 字段现在按 policy 链细分为：`rule_scorer`（无 policy 触发）、
+`rule_scorer:confidence_gate`、`rule_scorer:complaint_upgrade`、
+`rule_scorer:large_context_floor`、`rule_scorer:sticky`、`passthrough`
+（路由超时/异常时的透传）。
 
 这就是未来 P3 LightGBM 的训练数据底座。
+
+### LLM-as-Judge 绝对难度标注
+
+上面的 `label` 是**相对标签**（基于规则打分器自己的选择 ±1），训出来的模型只是
+规则打分器的影子。LLM-as-judge 读用户消息文本，独立判断"这个任务的真实难度是
+c几"，产出**绝对标签**。
+
+**Step 1：开启 raw content 捕获**（需要重启 server）：
+```ini
+CAPTURE_RAW_CONTENT=true      # 存最后一条 user 消息文本到 router-raw-*.jsonl
+```
+只存最后一条 user 消息（judge 判断难度的主信号），不存完整对话/响应。默认关 =
+隐私优先。可标注后删除 raw 文件，judge 标签持久保存在单独文件里。
+
+**Step 2：运行 judge 标注**（离线，调上游 API）：
+```sh
+uv run python scripts/judge_labels.py --date 2026-07-14
+uv run python scripts/judge_labels.py --date 2026-07-14 --limit 50 --delay 1.0  # 成本控制
+uv run python scripts/judge_labels.py --dry-run        # 只预览，不调 API
+uv run python scripts/judge_labels.py --skip-judged    # 跳过已标注的
+```
+输出 `router-judge-YYYY-MM-DD.jsonl`，每行一个绝对难度判断：
+```json
+{"decision_id":"...","optimal_tier":"c2","confidence":0.85,"reason":"multi-file refactor","judge_model":"gpt-5.5"}
+```
+
+**Step 3：合并标签**（realign 脚本自动合并 judge + outcome 信号）：
+```sh
+uv run python scripts/realign_labels.py --date 2026-07-14
+```
+标签优先级（最强信号优先）：
+1. `complaint_followup`（用户明确投诉）→ `under_routed`，optimal ≥ actual+1
+2. **judge**（绝对难度）→ 直接用 judge 的 `optimal_tier`
+3. `upstream_error`（模型无法服务）→ `under_routed`
+4. `label_hint`（token 效率启发式）→ ±1
+
+`label_source` 字段标注每条记录的标签来源，便于分析。
 
 ## 配置参考（`.env`）
 
@@ -314,6 +383,7 @@ ROUTER_CAPTURE_DIR=./logs      # 空 = 不捕获
 | `ROUTER_TIERS` | — | JSON 档→模型覆盖；空 = 内置 preset。 |
 | `ROUTER_DECISION_DB` | — | 可选 SQLite 路径，持久化决策。 |
 | `ROUTER_CAPTURE_DIR` | — | P3 前置：按日期分文件 JSONL 目录。 |
+| `CAPTURE_RAW_CONTENT` | `false` | 存用户消息文本到 `router-raw-*.jsonl`（judge 标注用）。默认关=不存 prompt 明文。 |
 | `ROUTER_LOG_DECISIONS` | `true` | INFO 打路由决策日志。 |
 
 ### P2 Ensemble
@@ -333,11 +403,17 @@ ROUTER_CAPTURE_DIR=./logs      # 空 = 不捕获
 | 路径 | 用途 |
 | --- | --- |
 | `.env` | 全部运行配置（已 gitignore，不进版本库）。 |
-| `logs/router-samples-YYYY-MM-DD.jsonl` | P3 训练数据（自动生成）。 |
+| `logs/router-samples-YYYY-MM-DD.jsonl` | P3 决策记录（路由时写入，`label` 待回填）。 |
+| `logs/router-outcomes-YYYY-MM-DD.jsonl` | P3 outcome 记录（上游返回后写入，sidecar）。 |
+| `logs/router-raw-YYYY-MM-DD.jsonl` | P3 raw content（user 消息文本，judge 标注用，opt-in）。 |
+| `logs/router-judge-YYYY-MM-DD.jsonl` | P3 judge 标签（LLM-as-judge 绝对难度，judge 脚本生成）。 |
+| `logs/router-labeled-YYYY-MM-DD.jsonl` | 离线回填后的带标签训练文件（realign 脚本生成）。 |
 | `src/relay/router/scorer.py` | 规则打分——P3 LightGBM 替换点。 |
 | `src/relay/ensemble.py` | B5 融合逻辑。 |
-| `src/relay/capture.py` | 按日期分文件 JSONL 捕获。 |
-| `tests/test_router_scoring.py` | 打分自测：`uv run python tests/test_router_scoring.py`。 |
+| `src/relay/capture.py` | decisions + outcomes + raw 三文件 JSONL 捕获。 |
+| `scripts/realign_labels.py` | 离线标签回填：`uv run python scripts/realign_labels.py --date YYYY-MM-DD`。 |
+| `scripts/judge_labels.py` | LLM-as-judge 标注：`uv run python scripts/judge_labels.py --date YYYY-MM-DD`。 |
+| `tests/test_router_scoring.py` | 打分 + 路由自测：`uv run python tests/test_router_scoring.py`。 |
 
 ## 路线图
 

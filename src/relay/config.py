@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # (router-samples-YYYY-MM-DD.jsonl). Empty = no capture. This is the training
     # data source for a future P3 LightGBM head; also useful for audit/cost.
     router_capture_dir: str = ""
+    # When true, also write the last user message text to a sidecar file
+    # (router-raw-YYYY-MM-DD.jsonl) for LLM-as-judge offline labeling.
+    # Default false — privacy-preserving (no prompt text stored unless opted in).
+    capture_raw_content: bool = False
 
     # ── P2 ensemble (B5 fusion: N proposers → 1 aggregator) ──
     # Ensemble wraps AFTER routing; only fires for routed tiers >= ensemble_min_tier
