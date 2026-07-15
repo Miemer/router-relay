@@ -11,7 +11,7 @@ turn 融合多个模型**。
 - **P1** 规则路由（特征 → `c0..c3` 档位 → 模型覆盖）—— 完成 ✅
 - **P2** B5 ensemble 融合（并行 proposer → aggregator LLM）—— 完成 ✅
 - **P3 前置** 按日期分文件 JSONL 捕获 + outcome sidecar + 抱怨回溯 + 离线标签回填 —— 完成 ✅
-- **P3** LightGBM 训练闭环 —— 待做（需要先攒真实流量 + outcome 数据）
+- **P3** LightGBM 训练闭环 —— （需要先攒真实流量 + outcome 数据） —— 完成 ✅
 
 ## 目录结构
 
