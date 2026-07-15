@@ -68,15 +68,23 @@ class Settings(BaseSettings):
     # Ensemble wraps AFTER routing; only fires for routed tiers >= ensemble_min_tier
     # so easy turns stay single-model (cost/latency). Requires ROUTER_ENABLED=true.
     ensemble_enabled: bool = False
+    # Ensemble mode: "b5_fusion" (aggregator fuses drafts) or "best_of_n" (scorer
+    # picks the single best draft). B5 is better for synthesis; best_of_n is
+    # cheaper and better for tasks with a clear correct answer.
+    ensemble_mode: str = "b5_fusion"
     # Proposer model ids (comma-separated in env). The routed anchor model is
     # auto-prepended if not already present.
     ensemble_proposers: Annotated[list[str], NoDecode] = Field(default_factory=list)
     # Aggregator model id; empty = use the routed anchor as aggregator too.
     ensemble_aggregator: str = ""
+    # Scorer model for best_of_n mode; empty = use the aggregator.
+    ensemble_scorer_model: str = ""
     # Only fuse when the routed tier rank is >= this (c0<c1<c2<c3).
     ensemble_min_tier: str = "c2"
     # Quorum: minimum successful proposers before aggregation.
     ensemble_min_successful: int = 2
+    # Cap on the number of proposers (cost control; anchor counts toward the cap).
+    ensemble_max_proposers: int = 3
     ensemble_proposer_timeout: float = 60.0
     ensemble_aggregator_timeout: float = 120.0
     # Truncate each candidate draft to this many chars in the aggregator prompt.

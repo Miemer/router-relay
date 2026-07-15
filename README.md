@@ -242,27 +242,38 @@ sticky 路由的 session key 由**第一条 user 消息**派生，故 per-会话
 
 ## P2 Ensemble
 
-B5 融合：复杂 turn（路由档位 ≥ `ENSEMBLE_MIN_TIER`）时，路由 anchor 模型 +
-配置的 proposer **并行**（非流式）出草稿，aggregator LLM 用 `<CANDIDATE N>`
-prompt 把草稿融合成最终答案。只用 `b5_fusion` 模式。简单 turn 仍走单模型。
+两种模式（`ENSEMBLE_MODE`）：
+
+- **`b5_fusion`**（默认）：复杂 turn（路由档位 ≥ `ENSEMBLE_MIN_TIER`）时，路由 anchor
+  模型 + 配置的 proposer **并行**（非流式）出草稿，aggregator LLM 用 `<CANDIDATE N>`
+  prompt 把草稿融合成最终答案。适合需要综合多视角的任务。
+- **`best_of_n`**：同样的并行 proposer 出草稿，但由 scorer LLM 评估选出**最佳单条**
+  草稿直接返回（不再调模型生成新答案）。适合有明确正确答案的任务（debugging、
+  事实问答），比 b5_fusion 更快更省。
+
+简单 turn（档位 < `ENSEMBLE_MIN_TIER`）仍走单模型，不触发 ensemble。
 
 ```ini
-ENSEMBLE_ENABLED=true              # 需先 ROUTER_ENABLED=true
-ENSEMBLE_PROPOSERS=qwen3-max,deepseek-r1   # 路由 anchor 自动加入
-ENSEMBLE_AGGREGATOR=qwen3-max             # 空则用路由 anchor
-ENSEMBLE_MIN_TIER=c2                      # 只在复杂档触发
-ENSEMBLE_MIN_SUCCESSFUL=2                  # 聚合前的 quorum
+ENSEMBLE_ENABLED=true                    # 需先 ROUTER_ENABLED=true
+ENSEMBLE_MODE=b5_fusion                  # 或 best_of_n
+ENSEMBLE_PROPOSERS=qwen3.7-plus,glm-5.2  # 路由 anchor(gpt-5.5) 自动加入
+ENSEMBLE_AGGREGATOR=gpt-5.5              # 融合模型；空则用路由 anchor
+ENSEMBLE_SCORER_MODEL=gpt-5.5            # best_of_n 的 scorer；空则用 aggregator
+ENSEMBLE_MIN_TIER=c2                     # 只在复杂档触发
+ENSEMBLE_MIN_SUCCESSFUL=2                # 聚合前的 quorum
+ENSEMBLE_MAX_PROPOSERS=3                 # 限制并发 proposer 数量（成本控制）
 ```
 
 行为：
 - **Quorum**：成功 proposer 少于 `ENSEMBLE_MIN_SUCCESSFUL` → 在路由 anchor 上
   `fallback_single`。
-- **非流式**：JSON 响应，usage 是所有 proposer + aggregator 求和。
-- **流式**：aggregator 的 SSE 原样转发；proposer 阶段先 await 完（无心跳——
-  proposer 错误返回干净 HTTP 错误，而非中断的 SSE 流）。
+- **非流式**：JSON 响应，usage 是所有 proposer + aggregator/scorer 求和。
+- **流式**：proposer 阶段每 5s 发 SSE 注释帧心跳（`: heartbeat\n\n`）防客户端
+  超时；proposer 完成后 b5_fusion 转发 aggregator 的 SSE，best_of_n 合成 SSE
+  帧从已选草稿直接发出（不再调模型）。
 - **tools**：带 `tools` 的请求跳过 ensemble（P2 不融合 tool-calling）。
 - **成本提醒**：推理模型当 proposer 会烧不受 `max_tokens` 限制的推理 token，
-  proposer 池建议用非推理模型。
+  proposer 池建议用非推理模型。`ENSEMBLE_MAX_PROPOSERS` 限制并发数量。
 
 ## P3 前置捕获
 
@@ -430,12 +441,15 @@ ROUTER_ML_MODEL_PATH=models/p3_v2.txt uv run router-relay
 | 变量 | 默认 | 用途 |
 | --- | --- | --- |
 | `ENSEMBLE_ENABLED` | `false` | 需 `ROUTER_ENABLED=true`。 |
+| `ENSEMBLE_MODE` | `b5_fusion` | `b5_fusion`（融合）或 `best_of_n`（选最佳）。 |
 | `ENSEMBLE_PROPOSERS` | — | proposer 模型 id，逗号分隔（anchor 自动加入）。 |
 | `ENSEMBLE_AGGREGATOR` | — | aggregator 模型；空 = 路由 anchor。 |
+| `ENSEMBLE_SCORER_MODEL` | — | best_of_n 的 scorer；空 = 用 aggregator。 |
 | `ENSEMBLE_MIN_TIER` | `c2` | 路由档位 ≥ 此才融合。 |
 | `ENSEMBLE_MIN_SUCCESSFUL` | `2` | 聚合前 quorum。 |
+| `ENSEMBLE_MAX_PROPOSERS` | `3` | 并发 proposer 上限（含 anchor，成本控制）。 |
 | `ENSEMBLE_PROPOSER_TIMEOUT` / `ENSEMBLE_AGGREGATOR_TIMEOUT` | `60` / `120` | 各阶段超时（秒）。 |
-| `ENSEMBLE_CANDIDATE_MAX_CHARS` | `24000` | aggregator prompt 里截断每条草稿。 |
+| `ENSEMBLE_CANDIDATE_MAX_CHARS` | `24000` | aggregator/scorer prompt 里截断每条草稿。 |
 
 ## 关键文件
 
@@ -459,8 +473,12 @@ ROUTER_ML_MODEL_PATH=models/p3_v2.txt uv run router-relay
 
 ## 路线图
 
-- **P2.5**：ensemble proposer 阶段加 SSE 心跳注释帧，防流式客户端超时；可选
-  `router_dynamic` proposer 选择。
+- ~~**P2.5**：ensemble proposer 阶段加 SSE 心跳注释帧~~ —— ✅ 已完成。
+  流式模式 proposer 阶段每 5s 发 `: heartbeat\n\n`，防客户端超时。
+- ~~**P2.5+**：best-of-N 模式 + dynamic proposer 选择~~ —— ✅ 已完成。
+  `ENSEMBLE_MODE=best_of_n` + `ENSEMBLE_MAX_PROPOSERS` 成本控制。
+- ~~**P3** 自学习~~ —— ✅ 基础完成。LightGBM 训练 + ML head 推理 + judge 标签管线。
+  待持续积累数据迭代重训。
 - **P3** 自学习：读捕获的 JSONL → 关联会话 → 标签 realignment（抱怨/重试信号）
   → 增量 LightGBM 重训 → session-holdout CV + 成本上限 gate → 原子指针切换 +
   live rollback，替换 `score_features`。

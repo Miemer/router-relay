@@ -24,14 +24,14 @@
     "c2",
     "c3"
   ],
-  "num_samples": 367,
+  "num_samples": 382,
   "tier_distribution": {
-    "c0": 165,
-    "c1": 174,
-    "c2": 24,
+    "c0": 169,
+    "c1": 181,
+    "c2": 28,
     "c3": 4
   },
-  "val_accuracy": 0.7808219178082192,
+  "val_accuracy": 0.7894736842105263,
   "schema_version": 1,
   "trained_on": [
     "2026-07-13",

@@ -72,15 +72,16 @@ async def _test_apply_router_signals_and_source() -> tuple[bool, str]:
     decision = await apply_router(body, settings, history)
     if decision is None:
         return False, "apply_router returned None for a simple prompt"
-    # signals must be a non-empty dict (scorer sub-scores).
+    # signals must be a non-empty dict (scorer sub-scores or ML probabilities).
     if not isinstance(decision.signals, dict) or not decision.signals:
         return False, f"signals empty/missing: {decision.signals!r}"
-    expected_keys = {"len_score", "code_score", "kw_score", "ctx_score"}
-    if not expected_keys.issubset(decision.signals):
-        return False, f"signals missing keys: {set(decision.signals)}"
-    # source must be a derived string (not the old hardcoded "rule_scorer" alone
-    # for a greeting — it should be plain "rule_scorer" since no policy fires).
-    if not decision.source.startswith("rule_scorer"):
+    # Accept either rule_scorer keys (len_score etc.) or ml_head keys (proba_cN).
+    rule_keys = {"len_score", "code_score", "kw_score", "ctx_score"}
+    ml_keys = {"proba_c0", "proba_c1", "proba_c2", "proba_c3"}
+    if not (rule_keys.issubset(decision.signals) or ml_keys.issubset(decision.signals)):
+        return False, f"signals missing expected keys: {set(decision.signals)}"
+    # source must start with rule_scorer or ml_head (depending on whether ML is active).
+    if not (decision.source.startswith("rule_scorer") or decision.source.startswith("ml_head")):
         return False, f"source not derived: {decision.source!r}"
     # to_record must include signals.
     rec = decision.to_record()
