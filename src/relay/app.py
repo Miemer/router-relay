@@ -401,3 +401,39 @@ async def router_decisions(request: Request, limit: int = 20):
     history: RoutingHistory = request.app.state.router_history
     items = [d.to_record() for d in history.recent_decisions(limit)]
     return JSONResponse(content={"decisions": items, "count": len(items)})
+
+
+@app.post("/v1/router/reload", dependencies=[Depends(verify_token)])
+async def router_reload(request: Request):
+    """Force a hot reload of the serving ML model from the registry / env path.
+
+    Operational escape hatch: normally the registry active pointer is re-read on
+    every routing decision, so a self-learn promote is picked up automatically.
+    This endpoint lets an operator (or the self-learn loop) force an immediate
+    refresh and confirm which model is now serving. Never blocks the request
+    path — on failure it reports the previous state and the rule scorer stays up.
+    """
+    from .router.ml_head import reload_ml_head
+    from .router.registry import load_registry
+
+    settings: Settings = get_settings()
+    head = reload_ml_head(settings)
+    reg = load_registry(settings.router_models_dir)
+    active = reg.active
+    return JSONResponse(content={
+        "reloaded": head is not None,
+        "serving": "ml_head" if head is not None else "rule_scorer",
+        "active_version": active.version if active else None,
+        "active_model_path": active.model_path if active else None,
+        "versions": len(reg.list()),
+    })
+
+
+@app.get("/v1/router/registry", dependencies=[Depends(verify_token)])
+async def router_registry(request: Request):
+    """Return the model registry (versions + active pointer) for inspection."""
+    from .router.registry import load_registry
+
+    settings: Settings = get_settings()
+    reg = load_registry(settings.router_models_dir)
+    return JSONResponse(content=reg.to_dict())

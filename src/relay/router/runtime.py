@@ -227,13 +227,14 @@ async def apply_router(body: dict, settings: "Settings", history: RoutingHistory
         # timeout. For the rule scorer this is sub-millisecond; for the P3 ML
         # head it's ~0.1ms (LightGBM predict). Timeout/exception → passthrough.
         #
-        # Scorer selection: if ROUTER_ML_MODEL_PATH is set and the model loads,
-        # the ML head replaces score_features. On any failure, falls back to
-        # the rule scorer transparently (never block a request for ML).
-        ml_head = None
-        if settings.router_ml_model_path:
-            from .ml_head import get_ml_head
-            ml_head = get_ml_head(settings.router_ml_model_path)
+        # Scorer selection (hot reload): the registry's active model is used
+        # when present, else ROUTER_ML_MODEL_PATH, else the rule scorer. The
+        # registry active pointer is read on every call, so a self-learn
+        # promote is picked up on the next decision without a restart. On any
+        # load failure, falls back to the rule scorer transparently (never
+        # block a request for ML).
+        from .ml_head import get_active_ml_head
+        ml_head = get_active_ml_head(settings)
 
         if ml_head is not None:
             score = await asyncio.wait_for(

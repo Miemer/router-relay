@@ -319,7 +319,7 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LLM-as-judge absolute difficulty labeling for P3.")
     p.add_argument("--date", default=today, help="YYYY-MM-DD (default: today)")
     p.add_argument("--dir", dest="capture_dir", default="logs", help="capture directory")
-    p.add_argument("--model", default="gpt-5.5", help="judge model id (default: gpt-5.5)")
+    p.add_argument("--model", default="gpt-5.6-terra", help="judge model id (default: gpt-5.6-terra)")
     p.add_argument("--limit", type=int, default=None, help="max decisions to judge")
     p.add_argument("--delay", type=float, default=0.5, help="seconds between API calls (default: 0.5)")
     p.add_argument("--max-chars", type=int, default=8000, help="truncate user message (default: 8000)")

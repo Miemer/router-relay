@@ -1,13 +1,24 @@
 """P3 ML head: LightGBM-based tier classifier (drop-in for score_features).
 
 This module replaces the rule-based ``score_features`` when a trained model is
-available (``ROUTER_ML_MODEL_PATH`` is set). It loads a LightGBM model saved by
-``scripts/train_p3.py`` and produces the same ``ScoreResult`` the rule scorer
-outputs, so ``apply_router`` / ``apply_policy`` work unchanged.
+available. It loads a LightGBM model saved by ``scripts/train_p3.py`` and
+produces the same ``ScoreResult`` the rule scorer outputs, so ``apply_router`` /
+``apply_policy`` work unchanged.
 
-Inference is ~0.1ms (numpy array → LightGBM predict). The model is loaded once
-at startup via ``get_ml_head()`` (lru_cache singleton). If loading fails, the
-caller falls back to the rule scorer (see ``runtime.apply_router``).
+Model selection (hot reload, no restart needed):
+  1. If the model registry (``models/registry.json``) has an active version,
+     that model is used — this is what the self-learning loop promotes to.
+  2. Else if ``ROUTER_ML_MODEL_PATH`` is set, that model is used (legacy path).
+  3. Else the rule scorer is used.
+
+Hot reload: the loaded ``MLHead`` is cached keyed by ``(path, mtime)`` so a
+registry promote (or an overwritten model file) is picked up on the next
+routing decision without a restart. ``reload_ml_head()`` / ``invalidate_ml_head()``
+force a refresh on demand (used by the reload endpoint / self-learn loop).
+
+Inference is ~0.1ms (numpy array → LightGBM predict). On any load failure the
+caller falls back to the rule scorer (see ``runtime.apply_router``) — never
+block a request for ML.
 
 The difficulty score is derived from the predicted class probabilities as a
 weighted expectation: difficulty = Σ(tier_rank_i × prob_i) / 3, mapping the
@@ -19,15 +30,17 @@ from __future__ import annotations
 import json
 import logging
 import os
-from functools import lru_cache
+import threading
 from typing import TYPE_CHECKING
 
 import lightgbm as lgb
 import numpy as np
 
+from .registry import active_model_path, registry_path_for
 from .scorer import ScoreResult, TIER_BOUNDS
 
 if TYPE_CHECKING:
+    from ..config import Settings
     from .features import FeatureBundle
 
 logger = logging.getLogger("relay.router.ml_head")
@@ -123,13 +136,20 @@ def _coerce(val) -> float:
         return 0.0
 
 
-@lru_cache(maxsize=1)
-def get_ml_head(model_path: str) -> MLHead | None:
-    """Load the ML head singleton. Returns None if loading fails.
+# ── Hot-reload cache ─────────────────────────────────────────────────────────
+# Cache a loaded MLHead keyed by (path, mtime). When the registry active
+# pointer flips to a new version (different path) or the model file is
+# overwritten (different mtime), the key changes and a fresh head is loaded on
+# the next routing decision — no restart required. The lock guards concurrent
+# routing threads; loading is idempotent so a benign race is harmless.
 
-    The caller (``runtime.apply_router``) checks the return value and falls
-    back to ``score_features`` when None — never block a request for ML.
-    """
+_cache_lock = threading.Lock()
+_cache: tuple[str, float] | None = None
+_cache_head: "MLHead | None" = None
+
+
+def _load_head(model_path: str) -> "MLHead | None":
+    """Load an MLHead for a path, or None on any failure (caller falls back)."""
     if not model_path or not os.path.exists(model_path):
         if model_path:
             logger.warning("ml_head: model not found at %s — using rule scorer", model_path)
@@ -139,3 +159,61 @@ def get_ml_head(model_path: str) -> MLHead | None:
     except Exception as exc:
         logger.warning("ml_head: failed to load %s (%s) — using rule scorer", model_path, exc)
         return None
+
+
+def _head_for_path(model_path: str) -> "MLHead | None":
+    """Return the cached head for (path, mtime), reloading when either changes."""
+    global _cache, _cache_head
+    try:
+        mtime = os.path.getmtime(model_path)
+    except OSError:
+        return _load_head(model_path)  # missing file → None (no caching of failure)
+    key = (model_path, mtime)
+    with _cache_lock:
+        if _cache == key:
+            return _cache_head
+        head = _load_head(model_path)
+        _cache = key
+        _cache_head = head
+        return head
+
+
+def get_ml_head(model_path: str) -> "MLHead | None":
+    """Hot-reloading loader for an explicit model path (legacy / env override).
+
+    Picks up file overwrites (mtime change) on the next call. Returns None if
+    loading fails so the caller falls back to ``score_features``.
+    """
+    return _head_for_path(model_path)
+
+
+def get_active_ml_head(settings: "Settings") -> "MLHead | None":
+    """Resolve the serving ML head: registry active model first, then env path.
+
+    Registry takes precedence so the self-learning loop can promote new models
+    without editing env or restarting. ``ROUTER_ML_MODEL_PATH`` remains as a
+    manual override / bootstrap path. Returns None → caller uses the rule scorer.
+    """
+    models_dir = settings.router_models_dir
+    reg_path = registry_path_for(models_dir)
+    if os.path.exists(reg_path):
+        active_path = active_model_path(models_dir)
+        if active_path:
+            return _head_for_path(active_path)
+    if settings.router_ml_model_path:
+        return _head_for_path(settings.router_ml_model_path)
+    return None
+
+
+def invalidate_ml_head() -> None:
+    """Drop the cached head so the next routing decision reloads from disk."""
+    global _cache, _cache_head
+    with _cache_lock:
+        _cache = None
+        _cache_head = None
+
+
+def reload_ml_head(settings: "Settings") -> "MLHead | None":
+    """Force-refresh and return the current serving head (used by reload endpoint)."""
+    invalidate_ml_head()
+    return get_active_ml_head(settings)

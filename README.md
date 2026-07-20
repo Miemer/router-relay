@@ -256,9 +256,9 @@ sticky 路由的 session key 由**第一条 user 消息**派生，故 per-会话
 ```ini
 ENSEMBLE_ENABLED=true                    # 需先 ROUTER_ENABLED=true
 ENSEMBLE_MODE=b5_fusion                  # 或 best_of_n
-ENSEMBLE_PROPOSERS=qwen3.7-plus,glm-5.2  # 路由 anchor(gpt-5.5) 自动加入
-ENSEMBLE_AGGREGATOR=gpt-5.5              # 融合模型；空则用路由 anchor
-ENSEMBLE_SCORER_MODEL=gpt-5.5            # best_of_n 的 scorer；空则用 aggregator
+ENSEMBLE_PROPOSERS=qwen3.7-plus,glm-5.2  # 路由 anchor(gpt-5.6-terra) 自动加入
+ENSEMBLE_AGGREGATOR=gpt-5.6-terra            # 融合模型；空则用路由 anchor
+ENSEMBLE_SCORER_MODEL=gpt-5.6-terra            # best_of_n 的 scorer；空则用 aggregator
 ENSEMBLE_MIN_TIER=c2                     # 只在复杂档触发
 ENSEMBLE_MIN_SUCCESSFUL=2                # 聚合前的 quorum
 ENSEMBLE_MAX_PROPOSERS=3                 # 限制并发 proposer 数量（成本控制）
@@ -379,30 +379,91 @@ uv run python scripts/train_p3.py --auto
 # 保存 models/p3_lightgbm.txt + models/p3_lightgbm.meta.json
 ```
 
-**激活**（`.env` 里设，重启 server）：
+**激活**（`.env` 里设，重启 server；legacy 单模型路径）：
 ```ini
 ROUTER_ML_MODEL_PATH=models/p3_lightgbm.txt
 ```
 设置后 `apply_router` 自动用 ML head 替代规则打分器；路径无效或加载失败 →
 透明回退到规则打分器（不阻塞请求）。`source` 字段标为 `ml_head`。
 
-**迭代重训**（攒更多数据后）：
+> 注：`ROUTER_ML_MODEL_PATH` 是手动 bootstrap / 覆盖路径。日常自学习请用
+> 下面的注册表热加载，**不需要重启**。
+
+### P3 自学习闭环（热加载注册表 + 编排 + 时间窗 holdout）
+
+上面"训练 → 改 env → 重启"是手动流程。自学习把整条链自动化成
+**无人值守闭环**，三个新增件：
+
+**1. 模型注册表（热加载，免重启）** — `src/relay/router/registry.py`
+`models/registry.json` 记录所有版本 + `active` 指针；`ml_head` 每次路由决策
+都重读 active 指针，promote 后**下一个请求即生效**（缓存 keyed by
+`(path, mtime)`，指针或文件变更自动重载）。注册表优先于
+`ROUTER_ML_MODEL_PATH`；目录由 `ROUTER_MODELS_DIR`（默认 `models`）指定。
+
 ```sh
-# 1. 对新流量跑 judge + realignment
-uv run python scripts/judge_labels.py --date 2026-07-20 --skip-judged
-uv run python scripts/realign_labels.py --date 2026-07-20
-
-# 2. 用全部日期数据重新训练（--auto 自动发现所有 router-labeled-*.jsonl）
-uv run python scripts/train_p3.py --auto
-# → 覆盖 models/p3_lightgbm.txt，重启 server 即生效
-
-# 保留多版本对比：
-uv run python scripts/train_p3.py --auto --output models/p3_v2.txt
-ROUTER_ML_MODEL_PATH=models/p3_v2.txt uv run router-relay
+# 手动触发热加载（运维兜底；正常 promote 会自动生效）
+curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/router/reload
+# 查看注册表（版本 + active 指针）
+curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/router/registry
 ```
 
-建议每攒 200-300 条新带标签数据重训一次，对比验证集准确率。
-数据到 1000+ 条后可关掉 `ROUTER_OBSERVE_ONLY=false` 让 ML head 真正接管路由。
+**2. 时间窗 holdout（防回归）** — `train_p3.py --holdout-days N`
+不再用随机 split 当评估标准，而是把**最近 N 天**数据按时间留出，在同一
+"未来窗口"上对比新模型 vs 现役模型（`--active-model`）。随机 split 会泄漏
+分布、掩盖回归；时间窗 holdout 才是"过去训练的模型能否泛化到未来"的
+真实检验。gate 规则：新模型在 holdout 上优于现役 + `--min-holdout-gain`
+才 `promote_ok=True`（比较口径见下面的成本敏感）。
+
+```sh
+uv run python scripts/train_p3.py --auto --holdout-days 7 \
+  --active-model models/p3_lightgbm.txt
+# meta.json 写入 holdout_accuracy / holdout_cost / cost_delta / promote_ok
+```
+
+**2b. 成本敏感训练（对齐业务目标）** — 默认开启
+路由是**决策问题**，不是分类问题：低估难度（便宜档跑复杂任务）伤质量，
+高估（贵档跑简单任务）只费钱——两者代价不对称。纯准确率训练把它们当等
+价，还会让多数类（c0/c1）淹没稀有但高代价的 c3（仅 ~2.6%）。成本敏感训练
+用**代价矩阵 `C[true,pred]`**（低估 ×`--under-mult`，高估 ×`--over-mult`）
+做两件事：
+
+- **样本加权**：训练样本权重 = 类权重 × 错分代价，聚焦高代价错误
+- **`expected_cost` 指标**：每样本平均错分成本，gate 默认按 `--gate-metric cost`
+  比较（新模型 cost 低于现役才 promote），而非准确率
+
+类权重用 **1/√频次**（温和补偿，c3≈2.06），可用 `--no-class-weight` 关。
+`--cost-mode tier-price` 按档位相对价格加权（价格用 `ROUTER_TIER_PRICE` env
+覆盖，默认 c0..c3 = 1/2/4/8）。
+
+```sh
+# 默认即成本敏感（under×3 / over×1，gate 按 cost）
+uv run python scripts/train_p3.py --auto --holdout-days 7 --active-model <active>
+# 调低估惩罚力度（质量问题敏感就调大）
+uv run python scripts/train_p3.py --auto --under-mult 5.0
+```
+
+> 实测效果：开启后 c3 recall 20%→50%，holdout expected_cost 0.591→0.506，
+> gate[cost] 正确判 PASS（纯准确率口径会因 acc 略降误判 FAIL）。
+
+**3. 编排脚本（一键闭环）** — `scripts/self_learn.py`
+幂等串接 `realign → judge → train(holdout+gate) → promote + 热加载`。
+首次运行会先把现有 `models/p3_lightgbm.txt` 注册为基准（bootstrap），避免
+"无基准时直接上线未验证候选"。gate 不过 → 保留现役，候选丢弃。
+
+```sh
+# 每天低峰由 cron / 任务计划触发一次
+uv run python scripts/self_learn.py --auto --holdout-days 7
+# 跳过 judge（更快，标签弱一些）
+uv run python scripts/self_learn.py --auto --no-judge
+# 只看计划，不训练不上线
+uv run python scripts/self_learn.py --auto --dry-run
+```
+
+旧版本都留在 `models/versions/`，回滚 = 把 `registry.json` 的 `active`
+指回旧版本（或调 `/v1/router/reload` 前先改指针）。
+
+> **触发调度**：用系统级定时器跑 `self_learn.py` 即可——Linux cron 或
+> Windows 任务计划程序，每天低峰一次。脚本本身幂等，失败保留现役模型。
 
 ## 配置参考（`.env`）
 
@@ -430,10 +491,12 @@ ROUTER_ML_MODEL_PATH=models/p3_v2.txt uv run router-relay
 | `ROUTER_CONFIDENCE_THRESHOLD` | `0.55` | 置信度低于此 → confidence_gate 升一档。 |
 | `ROUTER_LARGE_CONTEXT_CHARS` | `64000` | 上下文超此 → large_context_floor 抬到 c2。 |
 | `ROUTER_TIERS` | — | JSON 档→模型覆盖；空 = 内置 preset。 |
+| `ROUTER_TIER_PRICE` | `1/2/4/8` | JSON 档→相对价格（成本敏感 `--cost-mode tier-price` 用）。 |
 | `ROUTER_DECISION_DB` | — | 可选 SQLite 路径，持久化决策。 |
 | `ROUTER_CAPTURE_DIR` | — | P3 前置：按日期分文件 JSONL 目录。 |
 | `CAPTURE_RAW_CONTENT` | `false` | 存用户消息文本到 `router-raw-*.jsonl`（judge 标注用）。默认关=不存 prompt 明文。 |
-| `ROUTER_ML_MODEL_PATH` | — | P3：LightGBM 模型路径（`train_p3.py` 输出）。设置后 ML head 替代规则打分器；空或无效=规则打分器。 |
+| `ROUTER_ML_MODEL_PATH` | — | P3：LightGBM 模型路径（`train_p3.py` 输出）。设置后 ML head 替代规则打分器；空或无效=规则打分器。注册表无 active 时的回退/覆盖路径。 |
+| `ROUTER_MODELS_DIR` | `models` | P3 自学习：模型注册表（`registry.json`）+ 版本目录。注册表有 active 时优先于 `ROUTER_ML_MODEL_PATH` 并热加载。 |
 | `ROUTER_LOG_DECISIONS` | `true` | INFO 打路由决策日志。 |
 
 ### P2 Ensemble
@@ -462,13 +525,17 @@ ROUTER_ML_MODEL_PATH=models/p3_v2.txt uv run router-relay
 | `logs/router-judge-YYYY-MM-DD.jsonl` | P3 judge 标签（LLM-as-judge 绝对难度，judge 脚本生成）。 |
 | `logs/router-labeled-YYYY-MM-DD.jsonl` | 离线回填后的带标签训练文件（realign 脚本生成）。 |
 | `src/relay/router/scorer.py` | 规则打分——P3 LightGBM 替换点。 |
-| `src/relay/router/ml_head.py` | P3 ML head：加载 LightGBM 模型 → `FeatureBundle → ScoreResult`。 |
+| `src/relay/router/ml_head.py` | P3 ML head：加载 LightGBM 模型 → `FeatureBundle → ScoreResult`（注册表热加载）。 |
+| `src/relay/router/registry.py` | P3 模型注册表：`models/registry.json` 版本管理 + active 指针 + 回滚。 |
 | `src/relay/ensemble.py` | B5 融合逻辑。 |
 | `src/relay/capture.py` | decisions + outcomes + raw 三文件 JSONL 捕获。 |
 | `scripts/realign_labels.py` | 离线标签回填：`uv run python scripts/realign_labels.py --date YYYY-MM-DD`。 |
 | `scripts/judge_labels.py` | LLM-as-judge 标注：`uv run python scripts/judge_labels.py --date YYYY-MM-DD`。 |
-| `scripts/train_p3.py` | LightGBM 训练：`uv run python scripts/train_p3.py --auto`。 |
-| `models/p3_lightgbm.txt` | 训练好的模型（`train_p3.py` 输出，`ROUTER_ML_MODEL_PATH` 指向）。 |
+| `scripts/train_p3.py` | LightGBM 训练（时间窗 holdout + gate）：`uv run python scripts/train_p3.py --auto`。 |
+| `scripts/self_learn.py` | 自学习编排：`uv run python scripts/self_learn.py --auto`（定时触发）。 |
+| `models/registry.json` | 模型注册表：版本列表 + active 指针（self_learn 写入，ml_head 热加载读）。 |
+| `models/versions/` | 版本化模型工件（promote 时归档，回滚用）。 |
+| `models/p3_lightgbm.txt` | 基准模型（legacy `ROUTER_ML_MODEL_PATH` 指向，bootstrap 基准）。 |
 | `tests/test_router_scoring.py` | 打分 + 路由自测：`uv run python tests/test_router_scoring.py`。 |
 
 ## 路线图
@@ -478,7 +545,8 @@ ROUTER_ML_MODEL_PATH=models/p3_v2.txt uv run router-relay
 - ~~**P2.5+**：best-of-N 模式 + dynamic proposer 选择~~ —— ✅ 已完成。
   `ENSEMBLE_MODE=best_of_n` + `ENSEMBLE_MAX_PROPOSERS` 成本控制。
 - ~~**P3** 自学习~~ —— ✅ 基础完成。LightGBM 训练 + ML head 推理 + judge 标签管线。
-  待持续积累数据迭代重训。
-- **P3** 自学习：读捕获的 JSONL → 关联会话 → 标签 realignment（抱怨/重试信号）
-  → 增量 LightGBM 重训 → session-holdout CV + 成本上限 gate → 原子指针切换 +
-  live rollback，替换 `score_features`。
+- ~~**P3+** 自学习闭环~~ —— ✅ 已完成（本次）。
+  热加载注册表（`registry.py`，promote 免重启）+ 编排脚本（`self_learn.py`，
+  realign→judge→train→gate→promote）+ 时间窗 holdout（`train_p3 --holdout-days`，
+  对比现役模型防回归）。定时器（cron / 任务计划）每天触发 `self_learn.py` 即自动迭代。
+  **后续增强**（成本敏感训练 + ε 探索防反馈循环 + 漂移监控）见下。

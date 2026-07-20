@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     # Empty = use the rule scorer (default). If the model fails to load, the
     # caller transparently falls back to the rule scorer (never blocks).
     router_ml_model_path: str = ""
+    # P3 self-learning: directory holding the model registry (registry.json)
+    # and versioned model artifacts. When a registry with an active model
+    # exists here, it takes precedence over router_ml_model_path and is
+    # hot-reloaded on promote (no restart needed). Empty = registry disabled.
+    router_models_dir: str = "models"
 
     # ── P2 ensemble (B5 fusion: N proposers → 1 aggregator) ──
     # Ensemble wraps AFTER routing; only fires for routed tiers >= ensemble_min_tier

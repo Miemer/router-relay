@@ -11,8 +11,14 @@ build/
 logs/
 *.db
 *.sqlite
+# P3 self-learning runtime state (registry + versioned artifacts, not source)
+models/registry.json
+models/versions/
+models/_candidate.*
 # IDE
 .idea/
 .zcode/
 # tooling artifacts
 .playwright-mcp/
+# local agent data
+.workbuddy/

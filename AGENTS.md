@@ -13,8 +13,8 @@ at this service; the relay forwards to an upstream OpenAI-compatible provider
 
 - **P1** rule-scores each turn's difficulty → `c0..c3` tier → overrides `model`.
 - **P2** B5 ensemble fusion (parallel proposers → aggregator LLM) for complex tiers.
-- **P3-prep** date-partitioned JSONL capture of aggregate features for future
-  LightGBM self-learning (P3 itself is not yet implemented).
+- **P3** LightGBM self-learning: JSONL capture → realign/judge labeling →
+  time-holdout training → registry-promoted ML head (hot reload, no restart).
 
 Inspired by OpenSquilla's `SquillaRouter` + Ensemble.
 
@@ -33,11 +33,15 @@ src/relay/
 └── router/
     ├── features.py    # handcrafted feature extraction (pure, no I/O, no prompt text)
     ├── scorer.py      # rule scorer → tier + confidence (P3 replacement point)
+    ├── ml_head.py     # P3 ML head: registry-driven hot-reload LightGBM → ScoreResult
+    ├── registry.py    # P3 model registry: models/registry.json versions + active pointer
     ├── policy.py      # confidence_gate → complaint_upgrade → large_context_floor → sticky
     ├── tiers.py       # DEFAULT_TIERS preset + resolve_model (source of truth)
     └── runtime.py     # RoutingDecision, RoutingHistory, bounded apply_router, _derive_source
 scripts/realign_labels.py  # offline label realignment (decisions + outcomes + judge → labeled)
 scripts/judge_labels.py    # LLM-as-judge absolute difficulty labeling (user msg → optimal_tier)
+scripts/train_p3.py        # LightGBM training (cost-sensitive + time-window holdout + gate vs active model)
+scripts/self_learn.py      # self-learning orchestration (realign→judge→train→gate→promote)
 tests/test_router_scoring.py  # standalone scoring + routing smoke test (NOT pytest)
 ```
 
@@ -115,6 +119,20 @@ needed). There is no pytest suite; the one test file is a script with `main()`.
   `rule_scorer:complaint_upgrade`, `rule_scorer:large_context_floor`,
   `rule_scorer:sticky`, `passthrough` (router timeout/exception). When the P3 ML
   head replaces `score_features`, set `source="ml_head"` at that call site.
+- **P3 self-learning deploy path** (added 2026-07-20): the serving model is the
+  registry's *active* version, not `ROUTER_ML_MODEL_PATH`. `runtime.apply_router`
+  calls `ml_head.get_active_ml_head(settings)`, which reads
+  `models/registry.json` on every decision (registry active → hot-reload; else
+  `ROUTER_ML_MODEL_PATH` → rule scorer). `scripts/self_learn.py` is the
+  orchestrator: on first run it **bootstraps the incumbent
+  `models/p3_lightgbm.txt` as the baseline version** (so a candidate must beat
+  it), then realign → judge → `train_p3 --holdout-days N` (time-window holdout,
+  compares candidate vs active on the future window) → promote via registry if
+  `promote_ok`. Schedule it with cron / Task Scheduler once daily. Hot reload is
+  keyed by `(path, mtime)` — a registry promote is picked up on the next request,
+  no restart. Rollback = flip `active` back in `registry.json` (older versions
+  stay in `models/versions/`). Ops endpoints: `POST /v1/router/reload`,
+  `GET /v1/router/registry`.
 - **`signals` (scorer sub-scores) are captured** in `to_record()` and the SQLite
   store. These are *additional* features (not part of `FeatureBundle`), safe to
   add — they don't affect the stable FeatureBundle contract.
