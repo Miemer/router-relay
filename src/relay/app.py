@@ -15,6 +15,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .auth import verify_token
 from .capture import CaptureStore
 from .config import Settings, get_settings
+from .converters import (
+    anthropic_request_to_openai,
+    openai_completion_to_anthropic,
+    openai_stream_to_anthropic,
+)
 from .ensemble import run_ensemble
 from .errors import RelayError
 from .router import DecisionStore, RoutingHistory, apply_router
@@ -114,6 +119,30 @@ def _error_outcome(decision, t0: float, executed_kind: str, status_code: int) ->
         "upstream_status": status_code,
         "label_hint": "under_routed",
     }
+
+
+def _to_anthropic_response(resp, decision) -> "JSONResponse | StreamingResponse":
+    """Translate an OpenAI-shaped ensemble response to Anthropic shape.
+
+    ``run_ensemble`` always returns OpenAI format (proposer/aggregator call
+    /chat/completions). On the /v1/messages path the client expects Anthropic,
+    so we convert here: JSONResponse body → Anthropic message, StreamingResponse
+    → wrapped Anthropic SSE stream.
+    """
+    if isinstance(resp, StreamingResponse):
+        model = decision.model or ""
+        return openai_stream_to_anthropic(resp, model)
+    # JSONResponse: body is the JSON-encoded bytes set at construction time.
+    body = getattr(resp, "body", None)
+    try:
+        data = json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+    except (json.JSONDecodeError, TypeError):
+        data = {}
+    model = (data.get("model") if isinstance(data, dict) else None) or decision.model or ""
+    return JSONResponse(
+        content=openai_completion_to_anthropic(data, model),
+        status_code=getattr(resp, "status_code", 200),
+    )
 
 
 def _make_stream_callback(
@@ -223,12 +252,14 @@ async def list_models(upstream: UpstreamClient = Depends(get_upstream)):
 
 
 async def _handle_completion(
-    request: Request, upstream: UpstreamClient, forward_path: str, allow_ensemble: bool
+    request: Request, upstream: UpstreamClient, forward_path: str, request_format: str = "openai"
 ):
     """Shared handler for OpenAI (/chat/completions) and Anthropic (/messages) paths.
 
-    ``forward_path`` is the upstream endpoint path; ``allow_ensemble`` is False on
-    the Anthropic path because ensemble calls /chat/completions (OpenAI-shaped).
+    ``forward_path`` is the upstream endpoint path. ``request_format`` selects the
+    client protocol: ensemble is implemented in OpenAI terms (proposers/aggregator
+    call /chat/completions, responses are OpenAI-shaped), so on the Anthropic path
+    the request is translated in and the response translated back out.
     Routing applies to both paths (it only reads `messages` + overrides `model`).
     """
     try:
@@ -312,7 +343,7 @@ async def _handle_completion(
                 pk, client_model, "scoring_unavailable", pfeat
             ))
 
-    # ── P2 ensemble: B5 fusion for complex tiers (OpenAI path only) ──
+    # ── P2 ensemble: B5 fusion for complex tiers (both paths) ──
     t0 = time.monotonic()
     can_capture = capture is not None and decision is not None
     # Streaming outcome callbacks (fire when the stream finishes, not now).
@@ -325,16 +356,18 @@ async def _handle_completion(
         if stream and can_capture else None
     )
     if (
-        allow_ensemble
-        and settings.ensemble_enabled
+        settings.ensemble_enabled
         and decision is not None
         and not settings.router_observe_only
         and not body.get("tools")  # P2 doesn't fuse tool-calling; skip when tools present
         and tier_rank(decision.tier) >= tier_rank(settings.ensemble_min_tier)
     ):
+        # Ensemble is OpenAI-shaped internally. On the Anthropic path, translate
+        # the request in; the synthesized OpenAI response is translated back out.
+        req_body = anthropic_request_to_openai(body) if request_format == "anthropic" else body
         try:
             ensemble_resp = await run_ensemble(
-                body, settings, upstream, decision, stream,
+                req_body, settings, upstream, decision, stream,
                 on_stream_done=on_done_ensemble,
             )
         except RelayError:
@@ -349,13 +382,17 @@ async def _handle_completion(
             ensemble_resp = None
         if ensemble_resp is not None:
             logger.info(
-                "ensemble: executed tier=%s anchor=%s", decision.tier, decision.model
+                "ensemble: executed tier=%s anchor=%s path=%s",
+                decision.tier, decision.model, request_format,
             )
             # Non-streaming: capture outcome now. Streaming: the callback fires
             # when the stream finishes (on_done_ensemble handles it).
             if not stream and can_capture:
                 outcome = _extract_outcome(ensemble_resp, decision, t0, "ensemble")
                 asyncio.create_task(capture.write_outcome(decision.decision_id, outcome))
+            # On the Anthropic path, translate the OpenAI-shaped result back out.
+            if request_format == "anthropic":
+                ensemble_resp = _to_anthropic_response(ensemble_resp, decision)
             return ensemble_resp
 
     # ── Single-model upstream path ──
@@ -381,18 +418,19 @@ async def _handle_completion(
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_token)])
 async def chat_completions(request: Request, upstream: UpstreamClient = Depends(get_upstream)):
     """OpenAI-compatible endpoint (opencode, openai clients, /v1/chat/completions)."""
-    return await _handle_completion(request, upstream, "/chat/completions", allow_ensemble=True)
+    return await _handle_completion(request, upstream, "/chat/completions", request_format="openai")
 
 
 @app.post("/v1/messages", dependencies=[Depends(verify_token)])
 async def anthropic_messages(request: Request, upstream: UpstreamClient = Depends(get_upstream)):
     """Anthropic-compatible endpoint (ZCode, /v1/messages).
 
-    Forwards to upstream /messages. Routing still applies (override model per tier);
-    the tier models must be Anthropic-capable on the upstream (see DEFAULT_TIERS).
-    Ensemble is skipped here — it calls /chat/completions (OpenAI-shaped).
+    Forwards to upstream /messages. Routing applies (override model per tier; the
+    tier models must be Anthropic-capable on the upstream — see DEFAULT_TIERS).
+    Ensemble also applies: the request is translated to OpenAI for the proposer/
+    aggregator calls and the synthesized response is translated back to Anthropic.
     """
-    return await _handle_completion(request, upstream, "/messages", allow_ensemble=False)
+    return await _handle_completion(request, upstream, "/messages", request_format="anthropic")
 
 
 @app.get("/v1/router/decisions", dependencies=[Depends(verify_token)])

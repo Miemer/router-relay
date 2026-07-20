@@ -31,6 +31,7 @@ router-relay/
     ├── capture.py             # P3 前置：decisions + outcomes 双文件 JSONL
     ├── config.py              # env 驱动配置（pydantic-settings）
     ├── ensemble.py            # P2：B5 融合（proposer → aggregator）
+    ├── converters.py          # OpenAI ↔ Anthropic 请求/响应形态转换（双路径 ensemble）
     ├── errors.py              # RelayError → OpenAI 形状错误信封
     ├── upstream.py            # httpx 客户端 + SSE 透传
     └── router/
@@ -130,10 +131,13 @@ uv run uvicorn relay.app:app --port 8787
 ## 5b. 连接 ZCode（Anthropic 端点）
 
 ZCode 用 **Anthropic** API 格式（`/v1/messages`），不是 OpenAI。relay 已加
-`/v1/messages` 端点（透传 + 路由；ensemble 在该路径跳过，因为它调
-`/chat/completions`）。DEFAULT_TIERS 也改成**双端点**模型（claude-3-5-haiku /
-qwen3.7-plus / claude-sonnet-4.5 / claude-opus-4-8——marketingforce 上同时支持
-openai+anthropic），所以同一套 preset 同时适配 opencode(OpenAI) 和 ZCode(Anthropic)。
+`/v1/messages` 端点（透传 + 路由 + **ensemble**）。路由在该路径同样生效；
+**ensemble 也已打通**：请求进入时转成 OpenAI 形态喂给 proposer/aggregator，
+合成结果再转回 Anthropic 形态返回（`src/relay/converters.py`）。所以 ZCode
+走 `/v1/messages` 也能享受多模型融合。DEFAULT_TIERS 用**双端点**模型
+（claude-3-5-haiku / qwen3.7-plus / claude-sonnet-4.5 / claude-opus-4-8——
+marketingforce 上同时支持 openai+anthropic），同一套 preset 同时适配
+opencode(OpenAI) 和 ZCode(Anthropic)。
 
 ZCode 的 provider 配置在 `~/.zcode/v2/config.json` 的 `provider` 对象里。加一条：
 
@@ -252,6 +256,12 @@ sticky 路由的 session key 由**第一条 user 消息**派生，故 per-会话
   事实问答），比 b5_fusion 更快更省。
 
 简单 turn（档位 < `ENSEMBLE_MIN_TIER`）仍走单模型，不触发 ensemble。
+
+**双路径支持**：ensemble 对 OpenAI 路径（`/v1/chat/completions`）和 Anthropic
+路径（`/v1/messages`）都生效。底层 proposer/aggregator 始终调 OpenAI 的
+`/chat/completions`，所以 Anthropic 请求进入时由 `src/relay/converters.py`
+转成 OpenAI 形态，合成结果再转回 Anthropic SSE / JSON。客户端走哪条路径
+都能触发融合。
 
 ```ini
 ENSEMBLE_ENABLED=true                    # 需先 ROUTER_ENABLED=true
@@ -528,6 +538,7 @@ uv run python scripts/self_learn.py --auto --dry-run
 | `src/relay/router/ml_head.py` | P3 ML head：加载 LightGBM 模型 → `FeatureBundle → ScoreResult`（注册表热加载）。 |
 | `src/relay/router/registry.py` | P3 模型注册表：`models/registry.json` 版本管理 + active 指针 + 回滚。 |
 | `src/relay/ensemble.py` | B5 融合逻辑。 |
+| `src/relay/converters.py` | OpenAI ↔ Anthropic 形态转换（让 ensemble 在 `/v1/messages` 路径生效）。 |
 | `src/relay/capture.py` | decisions + outcomes + raw 三文件 JSONL 捕获。 |
 | `scripts/realign_labels.py` | 离线标签回填：`uv run python scripts/realign_labels.py --date YYYY-MM-DD`。 |
 | `scripts/judge_labels.py` | LLM-as-judge 标注：`uv run python scripts/judge_labels.py --date YYYY-MM-DD`。 |

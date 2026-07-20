@@ -28,6 +28,7 @@ src/relay/
 ├── config.py          # pydantic-settings, lru_cached get_settings()
 ├── upstream.py        # httpx AsyncClient; SSE raw-byte passthrough
 ├── ensemble.py        # P2 B5 fusion (proposer → aggregator)
+├── converters.py      # OpenAI ↔ Anthropic shape adapters (dual-path ensemble)
 ├── capture.py         # P3-prep: decisions + outcomes + raw triple JSONL
 ├── errors.py          # RelayError → OpenAI-shaped error envelope
 └── router/
@@ -65,11 +66,12 @@ needed). There is no pytest suite; the one test file is a script with `main()`.
 ## Architecture boundaries (matter for edits)
 
 - **`app.py::_handle_completion`** is the shared handler for both
-  `/v1/chat/completions` (OpenAI, `allow_ensemble=True`, forwards to
-  `/chat/completions`) and `/v1/messages` (Anthropic, `allow_ensemble=False`,
-  forwards to `/messages`). **Ensemble is skipped on the Anthropic path** — it
-  calls `/chat/completions` (OpenAI-shaped). Routing applies to both paths
-  because it only reads `messages` and overrides `model`.
+  `/v1/chat/completions` (OpenAI, `request_format="openai"`) and
+  `/v1/messages` (Anthropic, `request_format="anthropic"`). **Both paths run
+  ensemble** — the OpenAI request is translated in (`src/relay/converters.py`)
+  for the proposer/aggregator calls (which hit `/chat/completions`) and the
+  OpenAI-shaped result is translated back out to Anthropic SSE/JSON. Routing
+  applies to both paths because it only reads `messages` and overrides `model`.
 - **`DEFAULT_TIERS` (tiers.py) is the source of truth** for tier→model. For both
   paths to work, the four models must be **dual-endpoint** (OpenAI + Anthropic)
   on the upstream (marketingforce supports both). If only one protocol is in
@@ -86,10 +88,12 @@ needed). There is no pytest suite; the one test file is a script with `main()`.
   any exception it returns `None` and the caller **transparently passes the
   client's original model through** — never block or fail a request for routing.
   This seam is deliberately forward-compatible with a P3 LightGBM/ONNX head.
-- **P2 ensemble wraps AFTER routing**, and only fires when: OpenAI path,
-  `ENSEMBLE_ENABLED=true`, a decision exists, **not** `router_observe_only`,
-  request has **no `tools`** (P2 does not fuse tool-calling), and routed tier
-  rank ≥ `ENSEMBLE_MIN_TIER`.
+- **P2 ensemble wraps AFTER routing**, and only fires when: `ENSEMBLE_ENABLED=true`,
+  a decision exists, **not** `router_observe_only`, request has **no `tools`**
+  (P2 does not fuse tool-calling), and routed tier rank ≥ `ENSEMBLE_MIN_TIER`.
+  **Fires on BOTH OpenAI and Anthropic paths** — `converters.py` translates the
+  request/response in and out; the internal proposer/aggregator calls are always
+  OpenAI `/chat/completions`.
 - **Scoring + feature extraction are pure** (no I/O, no embeddings, no prompt
   text). The `FeatureBundle` fields are the P3 training substrate — **keep them
   stable and aggregate-only**. Never store raw prompt text anywhere (features,
