@@ -13,7 +13,7 @@ DEFAULT_TIERS: dict[str, dict] = {
     "c0": {"model": "stepfun/step-3.7-flash", "description": "cheap / fast"},
     "c1": {"model": "qwen3.7-plus", "description": "medium"},
     "c2": {"model": "glm-5.2", "description": "strong"},
-    "c3": {"model": "gpt-5.5", "description": "strongest"},
+    "c3": {"model": "gpt-5.6-terra", "description": "strongest"},
 }
 
 _TIERS = ("c0", "c1", "c2", "c3")
