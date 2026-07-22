@@ -17,6 +17,7 @@ from .capture import CaptureStore
 from .config import Settings, get_settings
 from .converters import (
     anthropic_request_to_openai,
+    normalize_thinking_for_target,
     openai_completion_to_anthropic,
     openai_stream_to_anthropic,
 )
@@ -342,6 +343,23 @@ async def _handle_completion(
             asyncio.create_task(capture.write_passthrough(
                 pk, client_model, "scoring_unavailable", pfeat
             ))
+
+    # ── thinking normalization (target-aware; fixes the GLM "must be passed
+    # back" 400 AND the deepseek "thinking leaked" 400) ──
+    # Per-turn routing mixes thinking models (glm-5.2 / gpt-5.6-terra) with
+    # non-thinking models (deepseek-*) inside one conversation. We normalize
+    # based on the *executed* model (already overridden by routing above):
+    #   - thinking target  → keep the thinking param (intensity passes through);
+    #                         only fix a mixed assistant history.
+    #   - non-thinking target → strip ALL thinking content + the top-level
+    #     thinking param (otherwise the non-thinking model 400s).
+    # Mutates the (already model-overridden) body in place.
+    if settings.relay_normalize_reasoning:
+        _msgs = body.get("messages")
+        if isinstance(_msgs, list):
+            executed_model = str(body.get("model") or "")
+            target_thinks = executed_model in settings.relay_thinking_models
+            normalize_thinking_for_target(body, request_format, target_thinks)
 
     # ── P2 ensemble: B5 fusion for complex tiers (both paths) ──
     t0 = time.monotonic()

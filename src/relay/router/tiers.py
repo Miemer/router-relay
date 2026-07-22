@@ -10,8 +10,8 @@ DEFAULT_TIERS: dict[str, dict] = {
     # endpoints on marketingforce, so the same preset works for opencode (OpenAI
     # path) and ZCode (Anthropic path). If you only use one path you may swap in
     # endpoint-specific models (e.g. qwen3-max is OpenAI-only — cheaper for c0).
-    "c0": {"model": "stepfun/step-3.7-flash", "description": "cheap / fast"},
-    "c1": {"model": "qwen3.7-plus", "description": "medium"},
+    "c0": {"model": "deepseek-v4-flash", "description": "cheap / fast"},
+    "c1": {"model": "deepseek-v4-pro", "description": "medium"},
     "c2": {"model": "glm-5.2", "description": "strong"},
     "c3": {"model": "gpt-5.6-terra", "description": "strongest"},
 }

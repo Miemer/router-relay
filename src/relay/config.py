@@ -69,6 +69,33 @@ class Settings(BaseSettings):
     # hot-reloaded on promote (no restart needed). Empty = registry disabled.
     router_models_dir: str = "models"
 
+    # ── reasoning_content / thinking-block normalization ──
+    # When per-turn routing mixes a thinking model (e.g. glm-5.2 emits
+    # reasoning_content) with non-thinking models in one conversation, the
+    # upstream thinking model rejects the history with a 400 ("reasoning_content
+    # must be passed back"). This normalizes the assistant history to be
+    # reasoning-consistent (strips reasoning_content from all assistant messages
+    # only when the history is mixed). Disable only if you never route to a
+    # thinking model or handle consistency client-side.
+    relay_normalize_reasoning: bool = True
+
+    # Models that support chain-of-thought / thinking (emit AND consume
+    # reasoning_content / thinking blocks). Drives the target-aware thinking
+    # normalization in app.py: the *executed* model (after routing override) is
+    # checked against this set.
+    #   - executed model IN this set  → thinking-capable: keep its `thinking`
+    #     param (intensity / budget) so it passes through to the upstream, and
+    #     only fix mixed-history consistency (GLM "must be passed back" rule).
+    #   - executed model NOT in this set → non-thinking (e.g. deepseek-*): strip
+    #     ALL thinking content blocks + the top-level `thinking`/`reasoning`
+    #     param, otherwise the non-thinking model rejects with a 400.
+    # Comma-separated in env, or a JSON array. Empty/absent → built-in default
+    # below (glm-5.2 + gpt-5.6-terra think; deepseek-* are non-thinking and must
+    # NOT be in this set).
+    relay_thinking_models: Annotated[set[str], NoDecode] = Field(
+        default_factory=lambda: {"glm-5.2", "gpt-5.6-terra"}
+    )
+
     # ── P2 ensemble (B5 fusion: N proposers → 1 aggregator) ──
     # Ensemble wraps AFTER routing; only fires for routed tiers >= ensemble_min_tier
     # so easy turns stay single-model (cost/latency). Requires ROUTER_ENABLED=true.
@@ -121,6 +148,19 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [m.strip() for m in value.split(",") if m.strip()]
         return list(value) if value else []
+
+    @field_validator("relay_thinking_models", mode="before")
+    @classmethod
+    def _parse_thinking_models(cls, value: object) -> set[str]:
+        # Only invoked when the field is explicitly provided (env / init kwarg).
+        # Accept a comma-separated string or a JSON array/set. The built-in
+        # default (glm-5.2 + gpt-5.6-terra think; deepseek-* non-thinking) is set
+        # by the field's default_factory and is NOT re-applied here.
+        if isinstance(value, str):
+            return {m.strip() for m in value.split(",") if m.strip()}
+        if isinstance(value, (set, list, tuple)):
+            return set(value)
+        return set()
 
 
 @lru_cache
