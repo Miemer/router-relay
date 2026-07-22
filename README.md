@@ -425,8 +425,7 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/router/registry
 才 `promote_ok=True`（比较口径见下面的成本敏感）。
 
 ```sh
-uv run python scripts/train_p3.py --auto --holdout-days 7 \
-  --active-model models/p3_lightgbm.txt
+uv run python scripts/train_p3.py --auto --holdout-days 7 --active-model models/p3_lightgbm.txt
 # meta.json 写入 holdout_accuracy / holdout_cost / cost_delta / promote_ok
 ```
 

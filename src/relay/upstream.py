@@ -211,6 +211,14 @@ class UpstreamClient:
                     async for chunk in resp.aiter_bytes():
                         if chunk:
                             yield chunk
+                except httpx.HTTPError:
+                    # Upstream closed the connection before the chunked body was
+                    # complete (e.g. httpx.RemoteProtocolError). We can't recover
+                    # a partial SSE body into a valid response, so end the stream
+                    # cleanly instead of crashing the ASGI app with an unhandled
+                    # exception. The client sees a truncated stream (upstream's
+                    # fault), but the server stays alive.
+                    logger.warning("upstream stream ended prematurely in fast path")
                 finally:
                     await resp.aclose()
                 return
@@ -231,6 +239,14 @@ class UpstreamClient:
                 if buffer:
                     _parse_sse_event(buffer, captured)
                 captured["stream_completed"] = True
+            except httpx.HTTPError:
+                # Upstream dropped the connection mid-stream (incomplete chunked
+                # read). Record the incomplete stream and end it gracefully
+                # instead of propagating the error into the ASGI server, which
+                # would otherwise kill the response with "Exception in ASGI
+                # application". on_stream_done still fires in the finally block.
+                captured["stream_completed"] = False
+                logger.warning("upstream stream ended prematurely in capture path")
             finally:
                 await resp.aclose()
                 # Fire-and-forget: schedule the outcome callback off the request

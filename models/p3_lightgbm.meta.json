@@ -24,14 +24,29 @@
     "c2",
     "c3"
   ],
-  "num_samples": 2955,
+  "num_samples": 377,
   "tier_distribution": {
-    "c0": 1257,
-    "c1": 1138,
-    "c2": 482,
-    "c3": 78
+    "c0": 167,
+    "c1": 180,
+    "c2": 26,
+    "c3": 4
   },
-  "val_accuracy": 0.8477157360406091,
+  "val_accuracy": 0.7733333333333333,
+  "holdout_days": 7,
+  "holdout_samples": 3469,
+  "holdout_accuracy": 0.5958489478235803,
+  "active_model_path": "models/p3_lightgbm.txt",
+  "active_holdout_accuracy": 0.8815220524646872,
+  "holdout_delta": -0.285673,
+  "cost_mode": "linear",
+  "under_mult": 3.0,
+  "over_mult": 1.0,
+  "class_weight": true,
+  "gate_metric": "cost",
+  "holdout_cost": 1.238108965119631,
+  "active_holdout_cost": 0.31363505332948977,
+  "cost_delta": -0.924474,
+  "promote_ok": false,
   "schema_version": 1,
   "trained_on": [
     "2026-07-13",
@@ -39,6 +54,8 @@
     "2026-07-15",
     "2026-07-16",
     "2026-07-17",
-    "2026-07-18"
+    "2026-07-18",
+    "2026-07-20",
+    "2026-07-21"
   ]
 }
